@@ -43,8 +43,10 @@ jobs:
             echo "$f  $((size/1024/1024))MB"
             [ "$size" -gt 500000 ] || { echo "::error::$f too small ($size bytes)"; exit 1; }
           done
-          # linux-amd64 与宿主同为 Linux/amd64，可直接跑 --status --json 冒烟
-          ./dist/zcode-patch-linux-x64 --json > /tmp/status.json
+          # linux-amd64 与宿主同为 Linux/amd64，可直接跑 --json 冒烟。
+          # CI 上没有安装 ZCode，状态会全部判为 unknown、退出码 2（工具约定
+          # 「部分/未知 ⇒ 非零」），这里只校验 JSON 结构，故容忍退出码。
+          ./dist/zcode-patch-linux-x64 --json > /tmp/status.json || true
           node -e "
             const d = require('/tmp/status.json');
             if (!Array.isArray(d) || d.length !== 9) { console.error('bad status json'); process.exit(1); }
