@@ -1,6 +1,6 @@
 ---
 name: zcode-patcher
-description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁工具：①自定义模型供应商思考等级（effort/thinking/budget_tokens 真正下发到请求体）②用量页去截断（打开统计图：趋势图/饼图全量展示）③模型菜单加宽（供应商子菜单 192/160px→384px，长模型名完整显示）④继续按钮（工具栏一键填入「继续」并发送）⑤TPS 状态栏（打开状态栏：输入框工具栏统计胶囊，时间·首 token·tok/s·out）⑥模型拉取（打开模型拉取：渠道页拉取模型/请求头模拟/视觉探测/删除持久化）⑦全消息可编辑（打开编辑历史：解除只有最后一条用户消息可编辑的限制）⑧去额度广告（去额度骚扰横幅：关闭「今日免费计划额度剩余 x%，可升级」升级广告，保留耗尽/受限提示）。只有当用户明确要求执行本 skill、或明确点名「zcode-patcher」时才加载；用户只是泛泛提到思考等级、用量图、状态栏、模型拉取、编辑历史、补丁等话题时，一律不要自动触发本 skill。"
+description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁工具：①自定义模型供应商思考等级（effort/thinking/budget_tokens 真正下发到请求体）②用量页去截断（打开统计图：趋势图/饼图全量展示）③模型菜单加宽（供应商子菜单 192/160px→384px，长模型名完整显示）④继续按钮（工具栏一键填入「继续」并发送）⑤TPS 状态栏（打开状态栏：输入框工具栏统计胶囊，时间·首 token·tok/s·out）⑥模型拉取（打开模型拉取：渠道页拉取模型/自定义请求头/视觉探测/删除持久化）⑦全消息可编辑（打开编辑历史：解除只有最后一条用户消息可编辑的限制）⑧去额度广告（去额度骚扰横幅：关闭「今日免费计划额度剩余 x%，可升级」升级广告，保留耗尽/受限提示）。只有当用户明确要求执行本 skill、或明确点名「zcode-patcher」时才加载；用户只是泛泛提到思考等级、用量图、状态栏、模型拉取、编辑历史、补丁等话题时，一律不要自动触发本 skill。"
 ---
 
 # ZCode 客户端补丁工具
@@ -16,7 +16,7 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 | 打开模型菜单加宽 | 供应商子菜单 192/160px→384px，长模型名完整显示 | `node zcode-patcher.js --menu-width [--check/--revert]` | app.asar 内渲染文件（同长度原地改字节） |
 | 继续按钮 | 输入框工具栏一键填入「继续」并发送（✨右侧） | `node zcode-patcher.js --continue-btn [--check/--revert]` | app.asar（重打包级：index.html 挂 zcode-continue.js + 新增脚本条目） |
 | 打开状态栏 | 输入框工具栏 TPS 统计胶囊 | `node zcode-patcher.js --tps-footer [--check/--revert]` | app.asar（重打包级：注入脚本 + 挂载 index.html） |
-| 打开模型拉取 | 渠道页「拉取模型」/请求头模拟/视觉探测/删除持久化 | `node zcode-patcher.js --modelhub [--check/--revert]` | app.asar（重打包级：preload/main/renderer 三条目改写） |
+| 打开模型拉取 | 渠道页「拉取模型」/自定义请求头/视觉探测/删除持久化 | `node zcode-patcher.js --modelhub [--check/--revert]` | app.asar（重打包级：preload/main/renderer 三条目改写） |
 | 打开编辑历史 | 解除只有最后一条用户消息可编辑的限制 | `node zcode-patcher.js --edit-all [--check/--revert]` | 内核 zcode.cjs（两处可逆文本替换） |
 | 增强提示词 | 输入框工具栏「✨ 增强」按钮：把草稿改写为结构化提示词（右键面板可指定模型/模式），原文可一键撤销 | `node zcode-patcher.js --enhance-btn [--check/--revert]` | app.asar（重打包级：preload IPC×2 + main handler×2 + index.html 挂 zcode-enhance.js） |
 | 去额度广告 | 关闭「今日免费计划额度剩余 x%，可升级」骚扰横幅，保留耗尽/受限提示 | `node zcode-patcher.js --quota-banner [--check/--revert]` | app.asar 内渲染文件（同长度原地改字节） |
@@ -318,7 +318,7 @@ node zcode-patcher.js --tps-footer --tps-src /path/to/zcode-tps.js   # 指定注
 | 拉取模型按钮 | 一键拉取任意 OpenAI 兼容端点的全量模型列表，ZCode 风格选择面板（搜索/全选/逐个勾选），确认后模型列表 = 勾选集合（手动添加的保留） |
 | 方言感知回退 | anthropic 渠道 `/v1/models` 优先、openai 系 `/models` 优先、gemini 走 `v1beta`，带不带 `/v1` 都能拉 |
 | 按方言认证 | anthropic 附 `x-api-key`+`Authorization` 双头、gemini 走 `x-goog-api-key` |
-| 请求头模拟 | Claude (`claude-cli`) / Codex (`codex_cli_rs`) 全套预设头，逐条勾选生效/移除、值可编辑、`session_id` 一键换新；粘性生效（改模型配置不再剥头） |
+| 自定义请求头 | Claude (`claude-cli`) / Codex (`codex_cli_rs`) 全套预设头，逐条勾选生效/移除、值可编辑、`session_id` 一键换新；粘性生效（改模型配置不再剥头） |
 | 视觉能力实测 | 对勾选模型发 1×1 测试图，OpenAI/Anthropic 双协议适配，真实响应判定 |
 | 删除持久化 | 删除的模型写入 `zcode.deletedModels`，不再被目录同步复活 |
 
@@ -352,8 +352,8 @@ node zcode-patcher.js --modelhub --revert   # 定点还原
 
 - **提示词模板**：移植自 WB Enhance Prompt 1.5.5（社区分享，模板原文保留）——模式经**右键面板**切换（localStorage 持久化）：**简洁模式**（WorkBuddy 原版，约 800 字符内，含分析流程与正反示例）、**创意模式**（充分展开不设字数，含意图范围/证据缺失上下文/精确内容保护/最终自检），两者都追加 OUTPUT LAYOUT 分段规则；语言严格跟随草稿，实际请求 max_tokens 简洁 4096 / 创意 16384（模板原文的 2048/4096 不采用）。模板对象在注入时以 JSON 字面量替换 main 块的 `__WB_TEMPLATES__` 占位（apply/revert 用同一最终串）。
 - **手动配置兜底**：`~/.zcode/enhance-config.json` 存在且含 baseURL+apiKey+model 时优先于评分链使用：`{"baseURL":"https://…/v1","apiKey":"sk-…","model":"模型id","kind":"openai或anthropic"}`（可选 headers 对象）。适合自动链路全部不可用时指定任意健康端点。
-- **渠道与模型选择（v4）**：候选渠道**先整体排除 `builtin:` 官方渠道**（官方 plan 渠道风控必 400，见下条），再按评分排序（selected +10、自带 apiKey +2、baseURL +1）；渠道凭据 = `options.apiKey` → `~/.zcode/v2/credentials.json` 的 OAuth token 兜底，无凭据直接跳过；渠道内模型按 `zcode.priority` 降序最多试 3 个（503 model_not_found 换下一模型），401/403 跳渠道、400+captcha/sign 特征识别为网关风控直接跳渠道；端点拼接防 `/v1/v1`；渠道 `options.headers` 自定义请求头透传。max_tokens：简洁 4096 / 创意 16384。
-- **渠道回退原因**：官方 plan 渠道（`zcode.z.ai`）有请求签名 + PoW + 阿里云 captcha 三层风控（内核 `X-Client-Sig`/`X-Client-Pow` 体系），纯直连必被 `HTTP 400 code:3007` 拦截且无法复刻——因此增强链路对 `builtin:` 官方渠道做**三层屏蔽**：自动评分链整体排除、面板不列出、面板指定路径（含 localStorage 旧残留）同样拒绝；增强流量只会落到手配的自定义渠道。
+- **渠道与模型选择（v4）**：候选渠道**先整体排除 `builtin:` 官方渠道**（官方 plan 渠道网关校验必 400，见下条），再按评分排序（selected +10、自带 apiKey +2、baseURL +1）；渠道凭据 = `options.apiKey` → `~/.zcode/v2/credentials.json` 的 OAuth token 兜底，无凭据直接跳过；渠道内模型按 `zcode.priority` 降序最多试 3 个（503 model_not_found 换下一模型），401/403 跳渠道、400+captcha/sign 特征识别为网关校验直接跳渠道；端点拼接防 `/v1/v1`；渠道 `options.headers` 自定义请求头透传。max_tokens：简洁 4096 / 创意 16384。
+- **渠道回退原因**：官方 plan 渠道（`zcode.z.ai`）有请求签名 + PoW + 阿里云 captcha 三层网关校验（内核 `X-Client-Sig`/`X-Client-Pow` 体系），纯直连必被 `HTTP 400 code:3007` 拦截且无法复刻——因此增强链路对 `builtin:` 官方渠道做**三层屏蔽**：自动评分链整体排除、面板不列出、面板指定路径（含 localStorage 旧残留）同样拒绝；增强流量只会落到手配的自定义渠道。
 - **模型/模式选择面板（v5，右键 ✨）**：面板实时列出 config.json 全部启用的自定义渠道（`builtin:` 官方渠道不列出；评分排序，标注协议/★当前渠道/无凭据）与渠道内全部模型（按 `zcode.priority` 降序，P 值标注），顶部切简洁/创意模式，另有「自动」档清除指定；enhance-config.json 手动条目以提示行展示。点击模型即指定并持久化（localStorage `zcode-enhance-model`），选择优先级：**面板指定 > enhance-config.json 手动配置 > 渠道评分链**；指定的渠道/模型在 config 中失效（被删/禁用/属 `builtin:` 官方渠道）时自动回退评分链——主进程拒绝指定、面板打开时顺手清掉失效指定并 toast 提示，toast 以实际使用的 model 为准。面板数据经新增 IPC `zcode-enhance:list-models` 实时读盘（改 config 即点即生效，无需重启）。preload 升级为四参转发 `(text, mode, channel, model)`——旧版单参 preload 会丢弃后三个参数；渲染端以 `enhanceListModels` 是否暴露判新版（contextBridge 包装的函数 `.length` 恒为 0，早期 `.length` 检测必误报「旧版」，勿再使用），判旧时在面板与 toast 中提示重打。
 - **引擎**：主进程实现 `zcode-enhance:run`（改写）与 `zcode-enhance:list-models`（面板数据）两个 IPC handler，均实时读盘：读 `~/.zcode/v2/config.json` + `setting.json`（`modelProviderFamilySelectedKeys` 解析当前渠道，兼容 `family:builtin:xxx` 多段前缀）与 `enhance-config.json`；anthropic 协议走 `{baseURL}/v1/messages`，openai 系走 `/v1/chat/completions`；max_tokens 简洁 4096 / 创意 16384，45s 超时，429 重试一次。
 - **交互**：空草稿 toast 提示；单击增强（按钮转「增强中…」），**右键**打开模型/模式选择面板；结果**替换输入框内容**（Lexical 编辑器，写入走 execCommand 由 Lexical beforeinput 同步内部 state），原文进撤销栈，toast「点击撤销」8 秒内可还原；失败 toast 错误详情。
@@ -380,7 +380,7 @@ node zcode-patcher.js --modelhub --revert   # 定点还原
 > | 深度 | 动哪里 | 覆盖需求 |
 > |---|---|---|
 > | L1 配置层 | `~/.zcode/v2/config.json` + 渠道页 UI | 建渠道 / 加模型 / 思考档位 / 视觉标注 / 自定义请求头——本节 7.2–7.6 |
-> | L2 载荷层 | modelhub 注入（`--modelhub`，见「四」） | 渠道页长出「拉取模型 / 视觉探测 / 请求头模拟 / 删除持久化」 |
+> | L2 载荷层 | modelhub 注入（`--modelhub`，见「四」） | 渠道页长出「拉取模型 / 视觉探测 / 自定义请求头 / 删除持久化」 |
 > | L3 内核层 | zcode.cjs 锚点补丁（`--check/--extract`，见「一」） | 自定义档名的思考参数真正下发到请求体 |
 >
 > AI 代执行约定：改 config.json 前先备份、确认 ZCode 已完全退出、写完做 JSON 语法校验，其余遵循「标准执行流程」。
@@ -413,7 +413,7 @@ capability.reasoning = { enabled, levels, providerOptionsByLevel }
 | `enabled` | 建议 | `false` 的渠道会被增强链路等直接跳过 |
 | `options.baseURL`（或顶层 `baseURL`） | ✅ | 服务端点；不带 `/v1` 结尾时调用方自动补（防 `/v1/v1`） |
 | `options.apiKey`（或顶层 `apiKey`） | 建议 | 为空时按凭据回退链取 OAuth token（见 7.7） |
-| `options.headers` | 可选 | 渠道级自定义请求头，随请求透传（请求头模拟的落点） |
+| `options.headers` | 可选 | 渠道级自定义请求头，随请求透传（自定义请求头的落点） |
 | `models` | ✅ | 模型表，键 = 模型 id（即请求体 `model` 字段的取值） |
 | `zcode.deletedModels` | 自动 | 删除持久化：删过的模型 id 记在这里，目录同步不再复活（L2 写入） |
 
@@ -458,7 +458,7 @@ capability.reasoning = { enabled, levels, providerOptionsByLevel }
 
 1. **协议方言继承（渠道 → 模型）**：模型 `kinds/defaultKind` 缺省继承渠道 `kind`，决定端点路径（anthropic `/v1/messages`、openai 系 `/v1/chat/completions`、gemini 走 `v1beta`）与认证头（anthropic `x-api-key` + `Authorization` 双头、openai 系 `Bearer`、gemini `x-goog-api-key`）。多协议网关在模型上覆盖 `kinds` 即可按模型切协议。
 2. **家族行为继承（模型 id → 内核家族分支）**：override 构建器按「ox-alpha 白名单 → glm-5.3 → kimi-k3 → config.reasoning → 家族兜底」顺序匹配；落到家族兜底（如未配 reasoning 的 deepseek 走 `CA()`）只有开/关两档、预算固定 1024。每档参数表 `providerOptionsByLevel` 只给白名单家族（claude/glm/deepseek 等）下发，自定义模型拿到空表——这正是 L3 补丁的兜底点。
-3. **命名白名单继承（最强，免配置免补丁）**：模型 id 含 `ox-alpha`（`/ox-alpha/i` 子串匹配）即进内核硬编码白名单，anthropic 协议原生获得 `low/high/max` 三档、`defaultLevel=max`；同端点其它模型无此待遇。想白嫖原生档位，命名是零成本手段（代价是 id 语义被占用）。
+3. **命名白名单继承（最强，免配置免补丁）**：模型 id 含 `ox-alpha`（`/ox-alpha/i` 子串匹配）即进内核硬编码白名单，anthropic 协议原生获得 `low/high/max` 三档、`defaultLevel=max`；同端点其它模型无此待遇。想免费获得原生档位，命名是零成本手段（代价是 id 语义被占用）。
 
 ### 7.4 集成路径 A：配置文件（手动，少量模型 / 精确控制）
 
@@ -476,7 +476,7 @@ capability.reasoning = { enabled, levels, providerOptionsByLevel }
 1. 填 baseURL + apiKey，选协议格式（方言）。
 2. **拉取模型**：按方言自动回退端点（anthropic `/v1/models` 优先、openai 系 `/models` 优先、gemini 走 `v1beta`；带不带 `/v1` 都能拉），全量列表 → 搜索/全选/逐个勾选 → 确认后**模型列表 = 勾选集合，手动添加的条目保留**。
 3. **视觉探测**：对勾选模型发 1×1 测试图实测（OpenAI/Anthropic 双协议适配），结果回填 `modalities`。
-4. **请求头模拟**：Claude (`claude-cli`) / Codex (`codex_cli_rs`) 全套预设头，逐条勾选、值可编辑、`session_id` 一键换新；写入渠道 `options.headers`，粘性生效（后续改模型配置不再剥头）。
+4. **自定义请求头**：Claude (`claude-cli`) / Codex (`codex_cli_rs`) 全套预设头，逐条勾选、值可编辑、`session_id` 一键换新；写入渠道 `options.headers`，粘性生效（后续改模型配置不再剥头）。
 5. **删除持久化**：删除的模型写入渠道 `zcode.deletedModels`，目录同步不会复活。
 6. 注意：拉取写入的条目用宽默认值（contextWindow 1M / maxOutputTokens 128000），有真实配额约束的模型回到路径 A 精修这两个字段与 `limit.output`。
 
@@ -488,11 +488,11 @@ capability.reasoning = { enabled, levels, providerOptionsByLevel }
 | 标准档名思考等级（low/medium/high/xhigh/max，≥3.9.1） | `reasoning.variants` 用标准名 | 无（原生通用表） | 请求体 `effort` 随档位变 |
 | 自定义档名（如 turbo）/ ZCode ≤ 3.8.1 | `reasoning.variants` 自定义名 | 思考等级补丁（「一」） | 外部日志见 `thinking.budget_tokens` 随档位变 |
 | 批量接入端点全量模型 | 路径 B | `--modelhub` | 渠道页出现「拉取模型」按钮 |
-| 网关校验 UA/版本头 | 请求头模拟（或手写 `options.headers`） | `--modelhub` | 外部请求日志可见模拟头 |
+| 网关校验 UA/版本头 | 自定义请求头（或手写 `options.headers`） | `--modelhub` | 外部请求日志可见自定义头 |
 | 视觉模型能力标注 | `modalities.input` 加 `image` | `--modelhub`（探测） | 带图对话成功 |
 | 增强按钮优先用某模型 | ✨ 右键面板直接选（存 localStorage，最简单）；或该条目 `zcode.priority` 调高 | 无（增强按钮见「六」） | 增强 toast 显示所选 model |
 | 指定任意健康端点做增强 | `~/.zcode/enhance-config.json`：`{baseURL, apiKey, model, kind}`（可选 `headers`），优先于评分链 | `--enhance-btn` | toast 返回 manual 渠道结果 |
-| 用官方 plan 渠道（`zcode.z.ai`）直连 | 无法直连：签名 + PoW + 阿里云 captcha 三层风控（内核 `X-Client-Sig`/`X-Client-Pow`），纯直连必 `HTTP 400 code:3007`；增强链路已整体屏蔽 `builtin:` 官方渠道（评分链/面板/指定路径三层过滤） | 无解 | 换自定义渠道 |
+| 用官方 plan 渠道（`zcode.z.ai`）直连 | 无法直连：签名 + PoW + 阿里云 captcha 三层网关校验（内核 `X-Client-Sig`/`X-Client-Pow`），纯直连必 `HTTP 400 code:3007`；增强链路已整体屏蔽 `builtin:` 官方渠道（评分链/面板/指定路径三层过滤） | 无解 | 换自定义渠道 |
 
 ### 7.7 验证与排障（自定义模型专属）
 
@@ -501,4 +501,4 @@ capability.reasoning = { enabled, levels, providerOptionsByLevel }
 - **400: budget_tokens 必须小于 max_tokens / max_tokens 缺失**：`limit.output` 与档位预算的约束关系，见「一」的映射表与输出上限约束。
 - **模型列表被拉取结果覆盖**：拉取语义 = 勾选集合 + 保留手动条目；被覆盖说明条目 id 撞车，检查重名。
 - **凭据回退链（增强链路实现）**：`options.apiKey` → `credentials.json` 的 OAuth token（`oauth:<provider>:access_token`，`enc:v1` 为 AES-256-GCM 密文，密钥取 `ZCODE_CREDENTIAL_SECRET` 或 `zcode-credential-fallback:<platform>:<home>:<username>`；优先 active provider 匹配）。
-- **增强按钮选中的渠道 ≠ UI 当前渠道**：先排除 `builtin:` 官方渠道，再按评分排序（选中 +10、自带 apiKey +2、baseURL +1）取最高；渠道内模型按 `zcode.priority` 降序最多试 3 个——503 model_not_found 换下一模型、401/403 跳渠道、400 + captcha/sign 特征识别为网关风控直接跳渠道。✨ 右键面板显式指定的渠道/模型优先于整条评分链（失效自动回退）。
+- **增强按钮选中的渠道 ≠ UI 当前渠道**：先排除 `builtin:` 官方渠道，再按评分排序（选中 +10、自带 apiKey +2、baseURL +1）取最高；渠道内模型按 `zcode.priority` 降序最多试 3 个——503 model_not_found 换下一模型、401/403 跳渠道、400 + captcha/sign 特征识别为网关校验直接跳渠道。✨ 右键面板显式指定的渠道/模型优先于整条评分链（失效自动回退）。

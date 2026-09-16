@@ -18,6 +18,7 @@
     "launcher/*.go",
     "launcher/go.mod",
     "README.md",
+    "NOTICE.md",
     "LICENSE"
   ],
   "engines": {

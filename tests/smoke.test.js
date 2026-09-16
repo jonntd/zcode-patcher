@@ -37,6 +37,15 @@ test("核心脚本存在", () => {
   }
 });
 
+test("许可与第三方归属文件存在", () => {
+  for (const f of ["LICENSE", "NOTICE.md"]) {
+    assert.ok(fs.existsSync(path.join(ROOT, f)), "缺失 " + f);
+  }
+  const notice = fs.readFileSync(path.join(ROOT, "NOTICE.md"), "utf8");
+  assert.ok(/MIT License/.test(notice), "NOTICE.md 未包含第三方 MIT 许可全文");
+  assert.ok(/CSSZYF/.test(notice), "NOTICE.md 未保留第三方版权归属");
+});
+
 test("所有 JS 脚本语法可解析", () => {
   for (const f of ["zcode-patcher.js", "zcode-tui.js", "zcode-tps.js", "zcode-enhance.js", "zcode-continue.js"]) {
     const r = run(path.join(ROOT, "scripts", f), ["--help"]);
