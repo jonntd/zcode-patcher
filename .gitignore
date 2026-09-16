@@ -1,0 +1,36 @@
+# Node
+node_modules/
+npm-debug.log*
+*.tgz
+.npm/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build artifacts (produced by `npm run build:all` / CI, not committed)
+dist/
+build/
+target/
+__pycache__/
+*.pyc
+*.spec
+
+# Local-only files
+*.local.json
+.env
+.env.*
+
+# Generated embed payload: scripts/build-launcher.js copies scripts/* here for
+# go:embed, so these are build artifacts, not sources. Run `npm run build` to
+# regenerate them before a direct `go build`.
+/launcher/*.js
+/launcher/*.json
+
+# A local verbatim copy of ZCode's own proprietary preload bundle
+# (out/preload/index.cjs inside app.asar) kept for reference while developing
+# patches. Not ours to redistribute — never publish it.
+/index.cjs
+

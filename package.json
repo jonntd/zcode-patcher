@@ -1,0 +1,50 @@
+{
+  "name": "zcode-patcher",
+  "version": "0.1.0",
+  "description": "Local patch toolkit for the ZCode desktop client — thinking-effort passthrough, usage-chart de-truncation, wider model menu, continue button, TPS footer, model hub, prompt enhancer, editable history, quota-banner removal.",
+  "bin": {
+    "zcode-patch": "scripts/zcode-tui.js"
+  },
+  "scripts": {
+    "start": "node scripts/zcode-tui.js",
+    "status": "node scripts/zcode-tui.js --status",
+    "build": "node scripts/build-launcher.js",
+    "build:all": "node scripts/build-launcher.js --all",
+    "build:host": "node scripts/build-launcher.js --host",
+    "test": "node tests/smoke.test.js"
+  },
+  "files": [
+    "scripts/",
+    "launcher/*.go",
+    "launcher/go.mod",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "zcode",
+    "patcher",
+    "electron",
+    "asar",
+    "thinking-effort",
+    "launcher",
+    "go"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jonntd/zcode-patcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jonntd/zcode-patcher/issues"
+  },
+  "homepage": "https://github.com/jonntd/zcode-patcher#readme",
+  "author": "jonntd",
+  "license": "AGPL-3.0-or-later"
+}

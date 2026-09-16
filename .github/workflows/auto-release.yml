@@ -1,0 +1,125 @@
+name: Auto Release
+
+# 每次 push 到 main：跑测试 → bump package.json 的 patch 版本 → 交叉编译六个
+# 平台的单文件启动器 → 冒烟校验 → 提交版本号 + 打 tag 推送 → 把产物挂到该
+# tag 的 GitHub Release，并清理只保留最新一版。
+#
+# 为什么自包含完成构建+发布：GITHUB_TOKEN 推送的 commit/tag 不会再触发其他
+# workflow（GitHub 官方行为，防循环），所以发布不能依赖 release.yml 的 tag
+# 触发。release.yml 仅作为「手动打 tag」时的备份路径保留。
+#
+# 顺序设计：先 bump（本地）→ build → smoke（校验产物可用）→ 全部通过才
+# push commit+tag → upload release。这样构建失败只留下未推送的本地版本号，
+# 不污染远程；已发布的 tag 必然对应一份构建通过的产物。
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  # 同一分支串行，避免两个 push 并发 bump 到同一版本号互相冲突。
+  group: auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run smoke tests
+        run: npm test
+
+      - name: Bump package.json to next patch version
+        id: bump
+        run: |
+          NEW=$(node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const parts = String(p.version).split('.');
+            const [a, b, c] = parts.map(Number);
+            if (parts.length !== 3 || ![a, b, c].every(Number.isInteger)) {
+              console.error('version is not a plain x.y.z number: ' + p.version);
+              process.exit(1);
+            }
+            p.version = a + '.' + b + '.' + (c + 1);
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+            console.log(p.version);
+          ")
+          echo "VERSION=$NEW" >> "$GITHUB_OUTPUT"
+          echo "bumped to $NEW"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: launcher/go.mod
+
+      - name: Build native launchers
+        run: npm run build:all
+
+      - name: Smoke test artifacts
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "building v$VERSION"
+          for f in \
+            dist/zcode-patch-win-x64.exe dist/zcode-patch-win-arm64.exe \
+            dist/zcode-patch-macos-x64 dist/zcode-patch-macos-arm64 \
+            dist/zcode-patch-linux-x64 dist/zcode-patch-linux-arm64; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          # 版本号必须已注入二进制（作为缓存标记），否则发布的产物版本错位。
+          strings dist/zcode-patch-linux-x64 | grep -q "$VERSION" \
+            || { echo "::error::launcher does not embed version $VERSION"; exit 1; }
+          # 宿主即 Linux/amd64，可直接运行产物验证非交互 JSON 输出。
+          chmod +x dist/zcode-patch-linux-x64
+          ./dist/zcode-patch-linux-x64 --json | node -e "
+            let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+              const d=JSON.parse(s);
+              if(!Array.isArray(d)||d.length!==9){console.error('bad status json');process.exit(1);}
+              console.log('launcher OK: '+d.length+' patches');
+            });"
+
+      - name: Commit, tag and push
+        run: |
+          NEW="${{ steps.bump.outputs.VERSION }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: v$NEW"
+          git tag "v$NEW"
+          # GITHUB_TOKEN 推送不触发其他 workflow，此处不会造成循环。
+          git push origin main
+          git push origin "v$NEW"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.VERSION }}
+          files: |
+            dist/zcode-patch-win-x64.exe
+            dist/zcode-patch-win-arm64.exe
+            dist/zcode-patch-macos-x64
+            dist/zcode-patch-macos-arm64
+            dist/zcode-patch-linux-x64
+            dist/zcode-patch-linux-arm64
+          generate_release_notes: true
+          make_latest: true
+
+      - name: Prune old releases
+        run: |
+          # 只保留最新一版 release（不删 git tag），避免仓库 release 页堆积。
+          gh release list --limit 100 --json tagName,isLatest \
+            --jq '.[] | select(.isLatest == false) | .tagName' \
+            | while read -r t; do
+              [ -n "$t" ] && gh release delete "$t" --yes || true
+            done
+        env:
+          GH_TOKEN: ${{ github.token }}

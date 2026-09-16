@@ -1,0 +1,52 @@
+name: Test
+
+# 每次 push 到 main / 任意 PR：跑冒烟测试，并确认全平台启动器能编译。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 本项目零运行时依赖（package.json 无 dependencies），因此直接跑脚本，
+      # 不执行 npm ci，也无需 package-lock.json。
+      - name: Run smoke tests
+        run: npm test
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: launcher/go.mod
+
+      - name: Build launchers (all platforms)
+        run: npm run build:all
+
+      - name: Verify artifacts
+        run: |
+          for f in \
+            dist/zcode-patch-win-x64.exe dist/zcode-patch-win-arm64.exe \
+            dist/zcode-patch-macos-x64 dist/zcode-patch-macos-arm64 \
+            dist/zcode-patch-linux-x64 dist/zcode-patch-linux-arm64; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+            size=$(stat -c%s "$f")
+            echo "$f  $((size/1024/1024))MB"
+            [ "$size" -gt 500000 ] || { echo "::error::$f too small ($size bytes)"; exit 1; }
+          done
+          # linux-amd64 与宿主同为 Linux/amd64，可直接跑 --status --json 冒烟
+          ./dist/zcode-patch-linux-x64 --json > /tmp/status.json
+          node -e "
+            const d = require('/tmp/status.json');
+            if (!Array.isArray(d) || d.length !== 9) { console.error('bad status json'); process.exit(1); }
+            console.log('linux launcher reports ' + d.length + ' patches');
+          "
