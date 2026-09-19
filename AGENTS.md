@@ -14,7 +14,7 @@
 
 ## 测试红线的含义
 
-`npm test`（20 项冒烟）里这些失败对应固定原因，按对应方式修，不要绕过断言：
+`npm test`（23 项冒烟）里这些失败对应固定原因，按对应方式修，不要绕过断言：
 
 - **「launcher/ 内嵌副本与 scripts/ 一致」失败** → 忘了同步：先 `cp scripts/*.js scripts/*.json launcher/`（或直接跑 build:all，它会拷）再重测；
 - **「--apply-all 打印用法」类 CLI 契约失败** → 改坏了 patcher/TUI 的参数面，先修代码。

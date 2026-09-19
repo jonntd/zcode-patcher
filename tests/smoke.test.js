@@ -115,6 +115,37 @@ test("批量操作覆盖未知状态并统一复查", () => {
   assert.ok(tui.includes("批量操作完成：成功"), "交互批量结果未汇总");
 });
 
+test("拉取模型：自然序排序、确认去重与载荷漂移升级", () => {
+  const ph = JSON.parse(fs.readFileSync(path.join(ROOT, "scripts/modelhub_payload.json"), "utf8"));
+  assert.ok(ph.MAIN_HANDLERS.includes("localeCompare"), "主进程拉取列表未用自然序排序");
+  assert.ok(!ph.MAIN_HANDLERS.includes(".sort().map(id=>"), "仍是默认字典序");
+  assert.ok(ph.RENDER_V2_HDR_INSERT.includes("trim().toLowerCase()"), "确认过滤未做大小写/空白归一");
+  assert.ok(ph.RENDER_V2_HDR_INSERT.includes("seen.has(k))continue;seen.add(k);"), "选择器内变体去重逻辑错误");
+  assert.ok(ph.HELPER_BLOCK.includes("if(ok.disabled)return;ok.disabled=!0;"), "确认按钮缺一次性锁");
+  const patcher = fs.readFileSync(CLI, "utf8");
+  assert.ok(patcher.includes("upgradeDrift"), "缺少 v2.1 载荷漂移升级路径");
+  assert.ok(patcher.includes("边界标记剥旧重注"), "漂移升级未按边界标记剥离");
+});
+
+test("preload 注入随内核形态选变体（3.14+ 绑定名 h→_）", () => {
+  const ph = JSON.parse(fs.readFileSync(path.join(ROOT, "scripts/modelhub_payload.json"), "utf8"));
+  assert.ok(ph.PRELOAD_V2_WITNESS && ph.PRELOAD_V2_WITNESS.includes("connectRemote:s((t,n,i)=>_.ipcRenderer.invoke"),
+    "见证串必须锚定 3.14+ 原生 connectRemote 体");
+  for (const [curKey, oldKey] of [["PRELOAD_INJECT_V2", "PRELOAD_INJECT"], ["ENH_PRELOAD_INJECT_V3", "ENH_PRELOAD_INJECT"]]) {
+    assert.ok(ph[curKey], "缺少 " + curKey + " 变体");
+    assert.ok(ph[curKey].includes("_.ipcRenderer.invoke"), curKey + " 未绑定 _.ipcRenderer");
+    // 变体除绑定名外必须与旧形态逐字符一致（h. 与 _. 等长），替换语义不变
+    assert.ok(ph[curKey].length === ph[oldKey].length, curKey + " 与旧形态长度不一致");
+    assert.ok(ph[curKey].split("_.ipcRenderer").join("h.ipcRenderer") === ph[oldKey],
+      curKey + " 与旧形态除绑定名外存在漂移");
+  }
+  const patcher = fs.readFileSync(CLI, "utf8");
+  assert.ok(patcher.includes("preWantsV2"), "modelhub 未按内核形态选择注入变体");
+  assert.ok(patcher.includes("preIsCurrent"), "enhance 未按内核形态选择注入变体");
+  assert.ok(patcher.includes("preload 注入形态与内核不匹配"), "--check 未暴露形态不匹配");
+  assert.ok(patcher.includes("[injectV3, injectNew, injectOld]"), "enhance 剥离未覆盖全部注入形态");
+});
+
 test("引擎批量落盘与状态登记", () => {
   const patcher = fs.readFileSync(CLI, "utf8");
   assert.ok(patcher.includes("function memAsarOpen"), "缺少 MemAsar 共享内存态");

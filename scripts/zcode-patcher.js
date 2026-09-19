@@ -854,20 +854,28 @@ function processUsageChart(asar, checkOnly, revert) {
 // 点① = 模型选择器 CF 组件的子菜单默认宽（未传 providerSubmenuClassName 的全部调用点，
 //        内置渠道选中态即走此路）；点② = composer 选中自定义渠道时传入的窄分支（保留
 //        --radix-dropdown-menu-content-available-width 钳制，窗口过窄时由 Radix 碰撞规避兜底）。
-const MENU_WIDTH_PATCHES = [
+// 3.12.x 起官方把点①默认宽改为自适应（w-max + min 12rem + 视口钳制），补丁目标已原生达成：
+// v2 组的点①降级为 native 只检测不改写；点②官方未动，两组同串。按组探测，旧版装 v1、新版装 v2。
+const MENU_WIDTH_VARIANTS = [
   {
-    pattern: Buffer.from("j??`w-48`", "utf8"),
-    replacement: Buffer.from("j??`w-96`", "utf8"),
-    desc: "子菜单默认宽 w-48(192px)→w-96(384px)",
+    label: "v1（旧版固定宽度）",
+    patches: [
+      { pattern: Buffer.from("j??`w-48`", "utf8"), replacement: Buffer.from("j??`w-96`", "utf8"), desc: "子菜单默认宽 w-48(192px)→w-96(384px)" },
+      { pattern: Buffer.from("`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), replacement: Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), desc: "自定义渠道子菜单 w-40(160px)→w-96(384px)，保留视口钳制" },
+    ],
   },
   {
-    pattern: Buffer.from("`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"),
-    replacement: Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"),
-    desc: "自定义渠道子菜单 w-40(160px)→w-96(384px)，保留视口钳制",
+    label: "v2（官方自适应 w-max）",
+    patches: [
+      { pattern: Buffer.from("j??`w-max min-w-[min(12rem,var(--radix-dropdown-menu-content-available-width))] max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), native: true, desc: "子菜单默认宽：官方已原生自适应（w-max），无需改写" },
+      { pattern: Buffer.from("`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), replacement: Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), desc: "自定义渠道子菜单 w-40(160px)→w-96(384px)，保留视口钳制" },
+    ],
   },
 ];
-for (const it of MENU_WIDTH_PATCHES) {
-  if (it.pattern.length !== it.replacement.length) die(`模型菜单补丁点等长校验失败: ${it.desc}`);
+for (const v of MENU_WIDTH_VARIANTS) {
+  for (const it of v.patches) {
+    if (it.replacement && it.pattern.length !== it.replacement.length) die(`模型菜单补丁点等长校验失败: ${v.label}/${it.desc}`);
+  }
 }
 
 function processMenuWidth(asar, checkOnly, revert) {
@@ -875,44 +883,62 @@ function processMenuWidth(asar, checkOnly, revert) {
   const asarSize = fs.statSync(asar).size;
   const state = asarOpen(asar);
 
-  // 定位：两锚点（原始形态或已打形态）落在同一渲染层大文件；文件名哈希随版本变，不硬编码
+  // 定位：锚点（原始形态或已打形态）落在同一渲染层大文件；文件名哈希随版本变，不硬编码。
+  // 版本组选择：组内每点必须计数健康（普通点有 orig/patched 之一，native 点恰 1 次），
+  // 否则 v1 组会凭遗留点②在 v2 内核上被误选中并报锚点异常。
   const candidates = [];
   for (const { path: p, ent } of walkEntries(state.header)) {
     if (!p.startsWith("out/renderer/assets/") || !p.endsWith(".js") || ent.size < 100000) continue;
-    const bytes = entryBytes(state, ent);
-    const stat = MENU_WIDTH_PATCHES.map((it) => ({
-      o: countBytes(bytes, it.pattern),
-      n: countBytes(bytes, it.replacement),
-    }));
-    if (stat.some((s) => s.o || s.n)) candidates.push({ path: p, ent, stat });
+    candidates.push({ path: p, ent, bytes: entryBytes(state, ent) });
   }
-  if (candidates.length !== 1) {
-    console.log(`[!] ${asar}\n    模型菜单锚点命中 ${candidates.length} 个文件（期望 1），版本结构可能已变，跳过`);
+  let variant = null;
+  let hit = null;
+  let kinds = null;
+  for (const v of MENU_WIDTH_VARIANTS) {
+    const h = candidates.filter((c) => v.patches.every((it) => {
+      const o = countBytes(c.bytes, it.pattern);
+      const n = it.replacement ? countBytes(c.bytes, it.replacement) : 0;
+      return it.native ? o === 1 : o + n > 0;
+    }));
+    if (h.length !== 1) continue;
+    const st = v.patches.map((it) => {
+      const o = countBytes(h[0].bytes, it.pattern);
+      const n = it.replacement ? countBytes(h[0].bytes, it.replacement) : 0;
+      return it.native ? (o === 1 ? "native" : "bad")
+        : o === 1 && n === 0 ? "orig"
+        : o === 0 && n === 1 ? "patched"
+        : "bad";
+    });
+    variant = v; hit = h[0]; kinds = st;
+    break;
+  }
+  if (!variant) {
+    console.log(`[!] ${asar}\n    模型菜单锚点未在任何锚点组唯一命中（期望 1 个文件），版本结构可能已变，跳过`);
     return;
   }
-  const { path: rel, ent, stat } = candidates[0];
+  const { path: rel, ent } = hit;
   const fname = rel.split("/").pop();
   const absOff = state.dataStart + Number(ent.offset);
-  const kinds = stat.map((s) =>
-    s.o === 1 && s.n === 0 ? "orig" : s.o === 0 && s.n === 1 ? "patched" : "bad");
   const patchedCnt = kinds.filter((k) => k === "patched").length;
+  const nativeCnt = kinds.filter((k) => k === "native").length;
   const badCnt = kinds.filter((k) => k === "bad").length;
-  const total = MENU_WIDTH_PATCHES.length;
+  const total = variant.patches.length;
+  const satisfied = patchedCnt + nativeCnt;
 
   if (checkOnly) {
     const st = badCnt ? "锚点计数异常（拒绝操作）"
-      : patchedCnt === total ? "已打"
+      : satisfied === total ? (patchedCnt === 0 ? "官方已原生，无需打" : "已打")
       : patchedCnt === 0 ? "未打"
-      : `不完整（${patchedCnt}/${total}）`;
+      : `不完整（${patchedCnt}/${total - nativeCnt}）`;
     let sideOk = false;
     try { sideOk = fs.existsSync(side) && readJson(side).asar_size === asarSize; } catch { sideOk = false; }
-    console.log(`[*] ${asar}\n    模型菜单加宽: ${st} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
+    console.log(`[*] ${asar}\n    模型菜单加宽: ${st} | 锚点组: ${variant.label} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
     return;
   }
 
   if (revert) {
     if (patchedCnt === 0) {
-      console.log(`[.] ${asar}\n    未打模型菜单加宽补丁，跳过`);
+      console.log(`[.] ${asar}\n    未打模型菜单加宽补丁${nativeCnt ? "（官方自适应形态，无改写点）" : ""}，跳过`);
       return;
     }
     if (badCnt) {
@@ -925,7 +951,7 @@ function processMenuWidth(asar, checkOnly, revert) {
     try {
       for (let i = 0; i < total; i++) {
         if (kinds[i] !== "patched") continue;
-        const it = MENU_WIDTH_PATCHES[i];
+        const it = variant.patches[i];
         fs.writeSync(fd, it.pattern, 0, it.pattern.length, absOff + raw.indexOf(it.replacement));
         ok++;
       }
@@ -933,7 +959,7 @@ function processMenuWidth(asar, checkOnly, revert) {
       fs.closeSync(fd);
     }
     rmQuiet(side);
-    console.log(`[+] ${asar}\n    已还原 ${ok}/${total} 处原始宽度（${fname}）`);
+    console.log(`[+] ${asar}\n    已还原 ${ok}/${total - nativeCnt} 处原始宽度（${fname}）`);
     return;
   }
 
@@ -942,8 +968,8 @@ function processMenuWidth(asar, checkOnly, revert) {
     console.log(`    [!] ${fname} | 锚点出现次数异常，拒绝盲改`);
     return;
   }
-  if (patchedCnt === total) {
-    console.log(`    [=] ${fname} | 已打，跳过`);
+  if (satisfied === total) {
+    console.log(`    [=] ${fname} | ${patchedCnt === 0 ? "官方已原生自适应，无需打" : "已打"}（${variant.label}），跳过`);
     return;
   }
   const raw = Buffer.from(entryBytes(state, ent));
@@ -951,21 +977,23 @@ function processMenuWidth(asar, checkOnly, revert) {
   try {
     for (let i = 0; i < total; i++) {
       if (kinds[i] !== "orig") continue;
-      const it = MENU_WIDTH_PATCHES[i];
+      const it = variant.patches[i];
       fs.writeSync(fd, it.replacement, 0, it.replacement.length, absOff + raw.indexOf(it.pattern));
       console.log(`    [+] ${fname} | ${it.desc}`);
     }
   } finally {
     fs.closeSync(fd);
   }
-  // 回读校验：等长替换，文件总长必须不变，且每点恰好只剩已打形态
+  // 回读校验：等长替换，文件总长必须不变；普通点恰剩已打形态，native 点保持原生
   const state2 = asarOpen(asar);
   const ent2 = walkEntries(state2.header).find((x) => x.path === rel)?.ent;
   const back = ent2 ? entryBytes(state2, ent2) : Buffer.alloc(0);
   const okAll = back.length === ent.size
-    && MENU_WIDTH_PATCHES.every((it) => countBytes(back, it.replacement) === 1 && countBytes(back, it.pattern) === 0);
+    && variant.patches.every((it) => it.native
+      ? countBytes(back, it.pattern) === 1
+      : countBytes(back, it.replacement) === 1 && countBytes(back, it.pattern) === 0);
   if (!okAll) console.log(`    [!] 回读校验未通过，请 --menu-width --revert 还原后排查`);
-  writeJson(side, { asar_size: asarSize, path: rel, patches: MENU_WIDTH_PATCHES.map((it) => ({ desc: it.desc })) });
+  writeJson(side, { asar_size: asarSize, path: rel, variant: variant.label, patches: variant.patches.map((it) => ({ desc: it.desc })) });
   console.log(`    状态记录: ${path.basename(side)}${okAll ? "" : "（校验异常）"}`);
 }
 
@@ -1398,14 +1426,20 @@ function processModelhub(asar, checkOnly, revert, mem) {
     return null;
   };
 
-  // renderer 大文件定位：内容锚点判定 v1/v2（旧版 ADD_BTN/QPT 组合 vs 新版 vRt 调用点）。
+  // renderer 大文件定位：内容锚点判定 v1/v2/v3（旧版 ADD_BTN/QPT 组合 vs vRt vs mbn 调用点）。
   // 哈希文件名随版本构建变化，一律不硬编码；期望恰有一版命中唯一文件。
+  // v3 = 3.12.x：压缩器把模型设置组件从 vRt 改名为 mbn（providerName 格式化函数 gw→nN），
+  // 参数表/调用点作用域变量（w/E/O）与注入块完全不变，仅锚点串内的符号名漂移。
   const v1Bufs = [Buffer.from(ph.ORIG_ADD_BTN, "utf8"), Buffer.from(ph.ORIG_QPT, "utf8")];
   const v2Buf = Buffer.from(ph.RENDER_V2_ANCHOR, "utf8");
-  // v2.1（模型列表头部）三点注入的字节：签名形参 / 调用点传参 / 头部按钮
+  const v3Buf = ph.RENDER_V3_ANCHOR ? Buffer.from(ph.RENDER_V3_ANCHOR, "utf8") : null;
+  // v2.1/v3.1（模型列表头部）三点注入的字节：签名形参 / 调用点传参 / 头部按钮
   const v2SigOld = ph.RENDER_V2_SIG_OLD ? Buffer.from(ph.RENDER_V2_SIG_OLD, "utf8") : null;
   const v2SigNew = ph.RENDER_V2_SIG_NEW ? Buffer.from(ph.RENDER_V2_SIG_NEW, "utf8") : null;
   const v2PropBuf = ph.RENDER_V2_INSERT ? Buffer.from(ph.RENDER_V2_INSERT, "utf8") : null;
+  const v3SigOld = ph.RENDER_V3_SIG_OLD ? Buffer.from(ph.RENDER_V3_SIG_OLD, "utf8") : null;
+  const v3SigNew = ph.RENDER_V3_SIG_NEW ? Buffer.from(ph.RENDER_V3_SIG_NEW, "utf8") : null;
+  const v3PropBuf = ph.RENDER_V3_INSERT ? Buffer.from(ph.RENDER_V3_INSERT, "utf8") : null;
   const v2HdrAnchor = ph.RENDER_V2_HDR_ANCHOR ? Buffer.from(ph.RENDER_V2_HDR_ANCHOR, "utf8") : null;
   const v2HdrInsert = ph.RENDER_V2_HDR_INSERT ? Buffer.from(ph.RENDER_V2_HDR_INSERT, "utf8") : null;
   // 旧版 v2（独立行按钮）整块注入串：仅为已打旧版的原地升级/还原保留
@@ -1441,18 +1475,26 @@ function processModelhub(asar, checkOnly, revert, mem) {
     const b = mem.get(p);
     const isV1 = v1Bufs.some((x) => b.includes(x));
     const isV2 = b.includes(v2Buf);
-    if (isV1 || isV2) found.push({ path: p, isV1, isV2 });
+    const isV3 = v3Buf && b.includes(v3Buf);
+    if (isV1 || isV2 || isV3) found.push({ path: p, isV1, isV2, isV3 });
   });
   const v1hits = found.filter((f) => f.isV1);
   const v2hits = found.filter((f) => f.isV2);
+  const v3hits = found.filter((f) => f.isV3);
   let mode = null;
   let rendRel = null;
-  if (v1hits.length === 1 && v2hits.length === 0) { mode = "v1"; rendRel = v1hits[0].path; }
-  else if (v2hits.length === 1 && v1hits.length === 0) { mode = "v2"; rendRel = v2hits[0].path; }
+  if (v1hits.length === 1 && v2hits.length === 0 && v3hits.length === 0) { mode = "v1"; rendRel = v1hits[0].path; }
+  else if (v2hits.length === 1 && v1hits.length === 0 && v3hits.length === 0) { mode = "v2"; rendRel = v2hits[0].path; }
+  else if (v3hits.length === 1 && v1hits.length === 0 && v2hits.length === 0) { mode = "v3"; rendRel = v3hits[0].path; }
   else {
-    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} v2=${v2hits.length} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
+    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} v2=${v2hits.length} v3=${v3hits.length} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
     return false;
   }
+  // 当前生效字节集：v3 与 v2 仅组件符号名不同，注入块/HDR 系共享（payload V3 字段缺省时回落 V2 以兼容旧载荷）
+  const sigOldBuf = mode === "v3" ? (v3SigOld || v2SigOld) : v2SigOld;
+  const sigNewBuf = mode === "v3" ? (v3SigNew || v2SigNew) : v2SigNew;
+  const callAnchorBuf = mode === "v3" ? (v3Buf || v2Buf) : v2Buf;
+  const propBuf = mode === "v3" ? (v3PropBuf || v2PropBuf) : v2PropBuf;
   if (!mem.has(MH_PRELOAD_REL) || !mem.has(MH_MAIN_REL)) {
     console.log(`[!] ${asar}\n    缺少 preload/main 条目，版本结构可能已变，跳过`);
     return false;
@@ -1465,6 +1507,19 @@ function processModelhub(asar, checkOnly, revert, mem) {
   ];
   const tagged = marks.filter(([rel, mark]) => mem.get(rel).includes(mark)).length;
 
+  // preload 注入变体：原生 connectRemote 体的 ipcRenderer 绑定名随内核构建漂移
+  // （3.14 起压缩器把 h 改名为 _，witness 串判版）。旧 h. 形态注入在新内核上运行时
+  // h.ipcRenderer 为 undefined（renderer 报「Cannot read properties of undefined
+  // (reading 'invoke')」），故按内核形态选注入串，漂移升级路径据此剥旧换新。
+  const preWitness = ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null;
+  const preInjV1 = Buffer.from(ph.PRELOAD_INJECT, "utf8");
+  const preInjV2 = ph.PRELOAD_INJECT_V2 ? Buffer.from(ph.PRELOAD_INJECT_V2, "utf8") : null;
+  const preNow = mem.get(MH_PRELOAD_REL);
+  const preWantsV2 = !!(preWitness && preInjV2 && preNow.includes(preWitness));
+  const preInjCur = preWantsV2 ? preInjV2 : preInjV1;
+  const preInjPrev = preWantsV2 ? preInjV1 : preInjV2;
+  const preDrift = !preNow.includes(preInjCur);
+
   let saved = null;
   if (fs.existsSync(side)) {
     try {
@@ -1475,9 +1530,10 @@ function processModelhub(asar, checkOnly, revert, mem) {
 
   if (checkOnly) {
     const rendBytes = mem.get(rendRel);
-    const isNewForm = v2SigNew && countBytes(rendBytes, v2SigNew) === 1 && mhV21Injected(rendBytes);
+    const isNewForm = sigNewBuf && countBytes(rendBytes, sigNewBuf) === 1 && mhV21Injected(rendBytes);
     const isLegacyForm = v2LegacyBuf && countBytes(rendBytes, v2LegacyBuf) === 1;
-    const st = tagged === 3 ? (isNewForm ? "已打" : isLegacyForm ? "已打（旧版独立行位置，重跑 --modelhub 原地升级）" : "已打")
+    const st = tagged === 3 ? (isNewForm ? (preDrift ? "已打（preload 注入形态与内核不匹配，重跑 --modelhub 原地升级）" : "已打")
+                              : isLegacyForm ? "已打（旧版独立行位置，重跑 --modelhub 原地升级）" : "已打")
       : (tagged ? `不完整（${tagged}/3）` : "未打");
     console.log(`[*] ${asar}\n    模型拉取补丁: ${st} | sidecar: ${saved ? "有" : "无"} | 渲染文件: ${rendRel.split("/").pop()}（锚点组 ${mode}）`);
     return false;
@@ -1500,20 +1556,23 @@ function processModelhub(asar, checkOnly, revert, mem) {
       }
       let r = null;
       if (rel === MH_PRELOAD_REL) {
-        const inj = Buffer.from(ph.PRELOAD_INJECT, "utf8");
-        if (countBytes(cur, inj) === 1) r = replaceOnce(cur, inj, Buffer.alloc(0));
+        for (const inj of [preInjV1, preInjV2]) {
+          if (!inj || countBytes(cur, inj) !== 1) continue;
+          r = replaceOnce(cur, inj, Buffer.alloc(0));
+          break;
+        }
       } else if (rel === MH_MAIN_REL) {
         const h = Buffer.from(ph.MAIN_HANDLERS, "utf8");
         if (countBytes(cur, h) === 1) r = replaceOnce(cur, h, Buffer.alloc(0));
       } else {
         // renderer：优先剥离 v2.1 三点注入（签名/传参/头部按钮），其次旧版 v2 注入块，最后走 v1 逐点反替换
-        if (v2SigNew && countBytes(cur, v2SigNew) === 1) {
-          let r2 = replaceOnce(cur, v2SigNew, v2SigOld);
-          const propApplied = Buffer.concat([v2Buf, v2PropBuf]);
+        if (sigNewBuf && countBytes(cur, sigNewBuf) === 1) {
+          let r2 = replaceOnce(cur, sigNewBuf, sigOldBuf);
+          const propApplied = Buffer.concat([callAnchorBuf, propBuf]);
           if (countBytes(r2, propApplied) !== 1) {
             r = null;   // 传参串漂移：走 sidecar 字节兜底
           } else {
-            r2 = replaceOnce(r2, propApplied, v2Buf);
+            r2 = replaceOnce(r2, propApplied, callAnchorBuf);
             r2 = mhV21StripHeader(r2);
             if (r2 === null) {
               r = null;   // 头部注入块漂移：走 sidecar 字节兜底
@@ -1564,28 +1623,57 @@ function processModelhub(asar, checkOnly, revert, mem) {
   }
 
   let upgradeLegacy = false;
+  let upgradeDrift = null;   // {mhIdx, mhEnd, helperIdx}：v2.1 载荷漂移升级的旧尾块边界
   if (tagged === 3) {
     const rendNow = mem.get(rendRel);
-    const isNewForm = v2SigNew && countBytes(rendNow, v2SigNew) === 1 && mhV21Injected(rendNow);
-    const isLegacyForm = v2LegacyBuf && countBytes(rendNow, v2LegacyBuf) === 1;
+    const isNewForm = sigNewBuf && countBytes(rendNow, sigNewBuf) === 1 && mhV21Injected(rendNow);
     if (isNewForm) {
-      console.log(`[=] ${asar}\n    已打模型拉取补丁（v2.1 列表头部位置），跳过`);
-      return false;
+      // 载荷漂移检查：三点结构在即视为已打，但 main/renderer 尾部的 modelhub 代码块
+      // 与当前载荷不一致时（修 bug/改排序/改文案后），按边界标记剥旧重注——
+      // 否则已部署安装永远拿不到载荷更新。
+      const mainNow = mem.get(MH_MAIN_REL);
+      const mhMark = Buffer.from('import{ipcMain as MdlH}from"electron";', "utf8");
+      const enhMark = Buffer.from('import{ipcMain as Zenh}from"electron";', "utf8");
+      const helperMark = Buffer.from(";window.__mhToast=(", "utf8");
+      const mainHandlers = Buffer.from(ph.MAIN_HANDLERS, "utf8");
+      const helperBlock = Buffer.from(ph.HELPER_BLOCK, "utf8");
+      const mhIdx = mainNow.lastIndexOf(mhMark);
+      const enhIdx = mhIdx >= 0 ? mainNow.indexOf(enhMark, mhIdx) : -1;
+      const mhEnd = enhIdx > mhIdx ? enhIdx : (mhIdx >= 0 ? mainNow.length : -1);
+      const helperIdx = rendNow.lastIndexOf(helperMark);
+      const mainTail = mhIdx >= 0 ? mainNow.subarray(mhIdx, mhEnd) : Buffer.alloc(0);
+      const rendTail = helperIdx >= 0 ? rendNow.subarray(helperIdx) : Buffer.alloc(0);
+      // 完整性自检：待剥尾部必须确实是我的块（含特征串），防边界标记在未来版本失配
+      const tailIsOurs = (mainTail.length === 0 || (mainTail.includes(Buffer.from("modelhub:fetch-models")) && mainTail.includes(Buffer.from("probe-vision"))))
+        && (rendTail.length === 0 || rendTail.includes(MH_MARK_RENDER));
+      const drift = tailIsOurs && (preDrift || !mainTail.equals(mainHandlers) || !rendTail.equals(helperBlock) || countBytes(rendNow, v2HdrInsert) !== 1);
+      if (!drift) {
+        console.log(`[=] ${asar}\n    已打模型拉取补丁（v2.1 列表头部位置），跳过`);
+        return false;
+      }
+      if (!tailIsOurs) {
+        console.log(`[!] ${asar}\n    v2.1 尾块边界校验失败（疑似版本结构变化），先 --modelhub --revert 再重打`);
+        return false;
+      }
+      console.log(`[*] 检测到 v2.1 载荷有更新（排序/去重/文案），按边界标记剥旧重注`);
+      upgradeDrift = { mhIdx, mhEnd, helperIdx };
+    } else {
+      const isLegacyForm = v2LegacyBuf && countBytes(rendNow, v2LegacyBuf) === 1;
+      if (!isLegacyForm) {
+        console.log(`[!] ${asar}\n    注入形态无法识别（标记在但新/旧注入块均未命中），先 --modelhub --revert 再重打`);
+        return false;
+      }
+      // 升级必须从 sidecar 原件整体回退三个条目后重打：当前 preload/main 已含旧注入，
+      // 直接套用注入串会二次注入（main 里 ipcMain.handle 同通道注册两次会抛异常，应用无法启动）
+      if (!saved || !(saved.files || []).some((f) => f.path === rendRel)) {
+        console.log(`[!] ${asar}\n    旧版注入的 sidecar 原件缺失或失配，无法安全原地升级；先 --modelhub --revert 再重打`);
+        return false;
+      }
+      console.log(`[*] 检测到旧版 v2 注入（独立行按钮），从 sidecar 原件回退后原地升级为 v2.1 列表头部位置`);
+      upgradeLegacy = true;
     }
-    if (!isLegacyForm) {
-      console.log(`[!] ${asar}\n    注入形态无法识别（标记在但新/旧注入块均未命中），先 --modelhub --revert 再重打`);
-      return false;
-    }
-    // 升级必须从 sidecar 原件整体回退三个条目后重打：当前 preload/main 已含旧注入，
-    // 直接套用注入串会二次注入（main 里 ipcMain.handle 同通道注册两次会抛异常，应用无法启动）
-    if (!saved || !(saved.files || []).some((f) => f.path === rendRel)) {
-      console.log(`[!] ${asar}\n    旧版注入的 sidecar 原件缺失或失配，无法安全原地升级；先 --modelhub --revert 再重打`);
-      return false;
-    }
-    console.log(`[*] 检测到旧版 v2 注入（独立行按钮），从 sidecar 原件回退后原地升级为 v2.1 列表头部位置`);
-    upgradeLegacy = true;
   }
-  if (tagged && !upgradeLegacy) {
+  if (tagged && !upgradeLegacy && !upgradeDrift) {
     console.log(`[!] ${asar}\n    注入状态不完整（${tagged}/3），先 --modelhub --revert 再重打`);
     return false;
   }
@@ -1593,6 +1681,59 @@ function processModelhub(asar, checkOnly, revert, mem) {
   // —— 组装补丁字节（先校验锚点各唯一一次） ——
   let preBuf = mem.get(MH_PRELOAD_REL);
   let mainBuf = mem.get(MH_MAIN_REL);
+  if (upgradeDrift) {
+    // v2.1 载荷漂移升级（自包含分支）：main/renderer 尾部按边界剥旧重注；
+    // 头部按钮位置式剥旧插新；preload 注入形态随内核漂移时同样剥旧重注——
+    // 走公共组装路径会给 preload/main 二次注入，所以这里独立完成并返回。
+    const { mhIdx, mhEnd, helperIdx } = upgradeDrift;
+    const mainNow = mem.get(MH_MAIN_REL);
+    const rendNow = mem.get(rendRel);
+    const mainNew = Buffer.concat([
+      mainNow.subarray(0, mhIdx),
+      Buffer.from(ph.MAIN_HANDLERS, "utf8"),
+      mainNow.subarray(mhEnd),
+    ]);
+    let rendNew = Buffer.concat([
+      rendNow.subarray(0, helperIdx),
+      Buffer.from(ph.HELPER_BLOCK, "utf8"),
+    ]);
+    const stripped = mhV21StripHeader(rendNew);
+    const aIdx = stripped === null ? -1 : stripped.indexOf(v2HdrAnchor);
+    if (aIdx < 0) {
+      console.log(`[!] ${asar}\n    头部按钮注入块边界校验失败，拒绝漂移升级；先 --modelhub --revert 再重打`);
+      return false;
+    }
+    const at = aIdx + v2HdrAnchor.length;
+    rendNew = Buffer.concat([
+      stripped.subarray(0, at),
+      Buffer.from(ph.RENDER_V2_HDR_INSERT, "utf8"),
+      stripped.subarray(at),
+    ]);
+    if (!checkBundleSyntax(rendNew, path.basename(rendRel))) return false;
+    mem.set(MH_MAIN_REL, mainNew);
+    mem.set(rendRel, rendNew);
+    let preFixed = false;
+    if (preDrift) {
+      if (!preInjPrev || countBytes(preNow, preInjPrev) !== 1) {
+        console.log(`[!] ${asar}\n    preload 旧注入形态不唯一/未命中，拒绝盲改；先 --modelhub --revert 再重打`);
+        return false;
+      }
+      const preStripped = replaceOnce(preNow, preInjPrev, Buffer.alloc(0));
+      const preAnchor = Buffer.from(ph.PRELOAD_ANCHOR, "utf8");
+      if (countBytes(preStripped, preAnchor) !== 1) {
+        console.log(`[!] ${asar}\n    剥离后 preload 锚点出现 ${countBytes(preStripped, preAnchor)} 次（期望 1），拒绝盲改`);
+        return false;
+      }
+      const preNew = replaceOnce(preStripped, preAnchor, Buffer.concat([preAnchor, preInjCur]));
+      if (!checkBundleSyntax(preNew, "out/preload/index.cjs")) return false;
+      mem.set(MH_PRELOAD_REL, preNew);
+      preFixed = true;
+    }
+    // sidecar 保留（仍持有首打时的干净原件，供 revert 兜底）；flush 内部刷新 asar_size
+    mem.flush(".modelhub-tmp");
+    console.log(`[+] ${asar}\n    模型拉取补丁载荷漂移升级完成（自然序排序 + 确认去重 + 按钮一次性锁）${preFixed ? "；preload 注入形态已随内核换新" : ""}`);
+    return true;
+  }
   let rendBuf = mem.get(rendRel);
   if (upgradeLegacy) {
     const orig = new Map((saved.files || []).map((f) => [f.path, Buffer.from(f.original_b64, "base64")]));
@@ -1626,20 +1767,24 @@ function processModelhub(asar, checkOnly, revert, mem) {
         return false;
       }
     }
+  } else if (upgradeDrift) {
+    // 不可达：漂移分支已在上方自包含返回；保留分支形状以防未来重排
+    console.log(`[!] ${asar}\n    漂移升级流程异常，拒绝盲改`);
+    return false;
   } else {
-    const aCnt = countBytes(rendBuf, v2Buf);
+    const aCnt = countBytes(rendBuf, callAnchorBuf);
     const residue = [
-      ["v2.1签名", v2SigNew], ["v2.1传参", v2PropBuf], ["v2.1按钮", v2HdrInsert],
+      ["v2.1签名", sigNewBuf], ["v2.1传参", propBuf], ["v2.1按钮", v2HdrInsert],
     ].map(([lbl, b]) => b ? countBytes(rendBuf, b) : 0).reduce((a, b) => a + b, 0);
     if (aCnt !== 1 || residue !== 0
-      || countBytes(rendBuf, v2SigOld) !== 1 || countBytes(rendBuf, v2HdrAnchor) !== 1) {
-      console.log(`[!] ${asar}\n    renderer 锚点组 v2 计数异常（call=${aCnt} 残留=${residue} sigOld=${countBytes(rendBuf, v2SigOld)} hdr=${countBytes(rendBuf, v2HdrAnchor)}，期望 1/0/1/1），拒绝盲改`);
+      || countBytes(rendBuf, sigOldBuf) !== 1 || countBytes(rendBuf, v2HdrAnchor) !== 1) {
+      console.log(`[!] ${asar}\n    renderer 锚点组 ${mode} 计数异常（call=${aCnt} 残留=${residue} sigOld=${countBytes(rendBuf, sigOldBuf)} hdr=${countBytes(rendBuf, v2HdrAnchor)}，期望 1/0/1/1），拒绝盲改`);
       return false;
     }
   }
 
   const pNew = replaceOnce(preBuf, preAnchor,
-    Buffer.from(ph.PRELOAD_ANCHOR + ph.PRELOAD_INJECT, "utf8"));
+    Buffer.concat([preAnchor, preInjCur]));
   const mNew = Buffer.concat([mainBuf, Buffer.from(ph.MAIN_HANDLERS, "utf8")]);
   let rNew;
   if (mode === "v1") {
@@ -1649,9 +1794,9 @@ function processModelhub(asar, checkOnly, revert, mem) {
     rNew = replaceOnce(rNew, Buffer.from(ph.STICKY_OLD, "utf8"), Buffer.from(ph.STICKY_NEW, "utf8"));
     rNew = replaceOnce(rNew, Buffer.from(ph.LE_OLD, "utf8"), Buffer.from(ph.LE_NEW, "utf8"));
   } else {
-    // v2.1 三点注入：① vRt 签名加 mhEndpoint 形参 ② 调用点 props 内传端点草稿数据（插在锚点之后才是 props 位置）③ 模型列表头部插入拉取按钮
-    rNew = replaceOnce(rendBuf, v2SigOld, v2SigNew);
-    rNew = replaceOnce(rNew, v2Buf, Buffer.concat([v2Buf, v2PropBuf]));
+    // v2.1/v3.1 三点注入：① 签名加 mhEndpoint 形参 ② 调用点 props 内传端点草稿数据（插在锚点之后才是 props 位置）③ 模型列表头部插入拉取按钮
+    rNew = replaceOnce(rendBuf, sigOldBuf, sigNewBuf);
+    rNew = replaceOnce(rNew, callAnchorBuf, Buffer.concat([callAnchorBuf, propBuf]));
     rNew = replaceOnce(rNew, v2HdrAnchor, Buffer.concat([v2HdrAnchor, v2HdrInsert]));
   }
   rNew = Buffer.concat([rNew, Buffer.from(ph.HELPER_BLOCK, "utf8")]);
@@ -1682,7 +1827,7 @@ function processModelhub(asar, checkOnly, revert, mem) {
   commit(".modelhub-tmp", (newSize) => writeJson(side, {
     asar_size: newSize,
     renderer_path: rendRel,
-    mode: mode === "v2" ? "v2.1" : mode,
+    mode: mode === "v2" ? "v2.1" : mode === "v3" ? "v3.1" : mode,
     files: originals.map(([rel, b]) => ({
       path: rel, size: b.length, original_b64: b.toString("base64"),
       ...(rel === rendRel && stickyAfter ? { sticky_after: stickyAfter } : {}),
@@ -1757,6 +1902,12 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   const anchorB = Buffer.from(ph.ENH_PRELOAD_ANCHOR_B, "utf8");
   const injectNew = Buffer.from(ph.ENH_PRELOAD_INJECT, "utf8");
   const injectOld = ph.ENH_PRELOAD_INJECT_V1 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V1, "utf8") : null;
+  // 内核 preload 第 2 代形态见证（3.14 起原生 connectRemote 体的 ipcRenderer 绑定名 h→_）：
+  // 该形态下必须用 V3 注入串，否则运行时 h.ipcRenderer 为 undefined（「reading 'invoke'」报错）。
+  const injectV3 = ph.ENH_PRELOAD_INJECT_V3 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V3, "utf8") : null;
+  const preWitness = ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null;
+  const injCur = injectV3 && preWitness && preBuf.includes(preWitness) ? injectV3 : injectNew;
+  const preIsCurrent = preBuf.includes(injCur);
   const handlers = buildEnhanceMainBlock(ph);
   const isV2 = mainBuf.includes(Buffer.from("zcode-enhance:list-models", "utf8"));
   // 新旧判读：主块与当前载荷逐字节一致、注入脚本与源文件一致，才算"已打（最新）"；
@@ -1767,7 +1918,8 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   const scriptIsCurrent = !!scriptCur0 && !!scriptSrc && scriptSrc.equals(scriptCur0);
 
   if (checkOnly) {
-    const st = tagged ? (isV2 ? (mainIsCurrent && scriptIsCurrent ? "已打" : "已打（载荷/脚本有更新，重跑 --enhance-btn 原地升级）")
+    const st = tagged ? (isV2 ? (mainIsCurrent && scriptIsCurrent ? (preIsCurrent ? "已打" : "已打（preload 注入形态与内核不匹配，重跑 --enhance-btn 原地升级）")
+                              : "已打（载荷/脚本有更新，重跑 --enhance-btn 原地升级）")
                               : "已打（旧版，重跑 --enhance-btn 原地升级）")
                       : (partial ? `不完整（${partial}/4）` : "未打");
     console.log(`[*] ${asar}\n    增强提示词按钮: ${st}`);
@@ -1799,9 +1951,9 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
     return buf;
   }
 
-  /** 移除 preload 注入串：新版优先，旧版串兜底（升级前的存量安装）。 */
+  /** 移除 preload 注入串：按内核形态的新版优先，旧版串兜底（升级前的存量安装）。 */
   function stripPreload(buf, bad) {
-    for (const inj of [injectNew, injectOld].filter(Boolean)) {
+    for (const inj of [injectV3, injectNew, injectOld].filter(Boolean)) {
       if (!buf.includes(inj)) continue;
       if (countBytes(buf, inj) !== 1) { bad.push("preload 注入串不唯一"); return buf; }
       return replaceOnce(buf, inj, Buffer.alloc(0));
@@ -1833,7 +1985,7 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   }
 
   // 打补丁 / 原地升级（旧版注入先剥离再按当前载荷重注入，partial 状态一并修复）
-  if (tagged && isV2 && mainIsCurrent && scriptIsCurrent) { console.log(`[=] ${asar}\n    已打增强按钮（载荷为最新），跳过`); return false; }
+  if (tagged && isV2 && mainIsCurrent && scriptIsCurrent && preIsCurrent) { console.log(`[=] ${asar}\n    已打增强按钮（载荷为最新），跳过`); return false; }
   const bad = [];
   let pre2 = stripPreload(preBuf, bad);
   let main2 = mainBuf.includes(ENH_MARK_MAIN) ? stripMainBlock(mainBuf, bad) : mainBuf;
@@ -1852,7 +2004,7 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   const scriptBytes = loadEnhanceSrc(srcPath);
 
   const head = anchor.subarray(0, anchor.length - Buffer.byteLength(tail));
-  const preNew = replaceOnce(pre2, anchor, Buffer.concat([head, injectNew, Buffer.from(tail)]));
+  const preNew = replaceOnce(pre2, anchor, Buffer.concat([head, injCur, Buffer.from(tail)]));
   const sep = main2.length && main2[main2.length - 1] === 0x0a ? Buffer.alloc(0) : Buffer.from("\n");
   const mainNew = Buffer.concat([main2, sep, handlers]);
   let idxNew = idxBuf;
@@ -1928,10 +2080,10 @@ function revertMhRenderer(cur, ph, stickyAfterB64) {
 function processEditAll(target, checkOnly, revert) {
   const side = target + ".editall.json";
   const ph = loadMhPayload();
-  // 每项为变体列表：旧内核 y/m 形态与新内核 v/f 形态，打时按内容命中选一。
+  // 每项为变体列表：旧内核 y/m → v/f → 3.12.x A/w 形态（混淆名随版本漂移，结构不变），打时按内容命中选一。
   const variants = [
-    ["P1", [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2]]],
-    ["P2", [[ph.P2_OLD, ph.P2_NEW]]],
+    ["P1", [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2], [ph.P1_OLD_V3, ph.P1_NEW_V3]]],
+    ["P2", [[ph.P2_OLD, ph.P2_NEW], [ph.P2_OLD_V2, ph.P2_NEW_V2]]],
   ].map(([lbl, list]) => [lbl, list.map(([o, n]) => [Buffer.from(o, "utf8"), Buffer.from(n, "utf8")])]);
 
   let data;
