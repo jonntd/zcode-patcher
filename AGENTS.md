@@ -30,7 +30,7 @@
 
 ZCode 自动升级会覆盖 app.asar/zcode.cjs（补丁消失是设计使然），随后锚点可能漂移。固定流水线：
 
-1. **摸底**：`node ~/.zcode/patcher/zcode-patcher.js --status --json`（或逐个 `--check`）→ 看哪些补丁仍命中、哪些报「版本结构可能已变」。锚点体系是按内容定位的，很多补丁跨版本天然可用，别一上来就全改。
+1. **摸底**：`node ~/.zcode/patcher/zcode-patcher.js --check`（或逐个带功能 flag `--check`，无 `--status` 这个参数）→ 看哪些补丁仍命中、哪些报「版本结构可能已变」或不适用。锚点体系是按内容定位的，很多补丁跨版本天然可用，别一上来就全改。
 2. **解包分析**：`node scripts/asar-extract.js <新asar> --list out/renderer/assets` 找大 bundle；`-o /tmp/newver out/main/index.js out/preload/index.cjs ...` 提取后 `node --check`（.mjs）+ 对旧版本副本 diff 搜符号改名。
 3. **适配原则**：锚点漂移 = **给 payload 加新变体组**（`*_V2` 模式，参照 quota 的 v1/v2、modelhub 的 v1/v2.1、editall 的 P1_V2），绝不改写旧变体——多版本安装共存靠这个。
 4. **验证**：`scripts/dev-bed.sh start`（拷副本→打全套→隔离启动→CDP 探活）→ 用 CDP 探针确认 `root-startup-loading` 不存在、rootLen 正常、注入按钮/DOM 几何正确。**不要在宿主上验证。**
