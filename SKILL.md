@@ -12,13 +12,14 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 | 能力 | 说法 | 命令 | 改哪里 |
 |---|---|---|---|
 | 思考等级透传 | 给自定义模型配思考等级 | `node zcode-patcher.js [--check/--revert/--extract]` | 内核 zcode.cjs（原地改写，.bak 备份） |
+|   ↳ 3.12+ 注意 | 内核已移除档位换算函数，补丁显示「不适用」属预期；原生替代＝模型设置的「推理档位映射」（levels=配置补丁集） | `--check` | 同上 |
 | 打开统计图 | 用量页趋势图/饼图去截断 | `node zcode-patcher.js --usage-chart [--check/--revert]` | app.asar 内渲染文件（同长度原地改字节） |
 | 打开模型菜单加宽 | 供应商子菜单 192/160px→384px，长模型名完整显示 | `node zcode-patcher.js --menu-width [--check/--revert]` | app.asar 内渲染文件（同长度原地改字节） |
-| 继续按钮 | 输入框工具栏一键填入「继续」并发送（✨右侧） | `node zcode-patcher.js --continue-btn [--check/--revert]` | app.asar（重打包级：index.html 挂 zcode-continue.js + 新增脚本条目） |
+| 继续按钮 | 输入框工具栏一键填入「继续」并发送（✨右侧；快捷键 `Cmd/Ctrl+Shift+J`） | `node zcode-patcher.js --continue-btn [--check/--revert]` | app.asar（重打包级：index.html 挂 zcode-continue.js + 新增脚本条目） |
 | 打开状态栏 | 输入框工具栏 TPS 统计胶囊 | `node zcode-patcher.js --tps-footer [--check/--revert]` | app.asar（重打包级：注入脚本 + 挂载 index.html） |
 | 打开模型拉取 | 渠道页「拉取模型」/自定义请求头/视觉探测/删除持久化 | `node zcode-patcher.js --modelhub [--check/--revert]` | app.asar（重打包级：preload/main/renderer 三条目改写） |
 | 打开编辑历史 | 解除只有最后一条用户消息可编辑的限制 | `node zcode-patcher.js --edit-all [--check/--revert]` | 内核 zcode.cjs（两处可逆文本替换） |
-| 增强提示词 | 输入框工具栏「✨ 增强」按钮：把草稿改写为结构化提示词（右键面板可指定模型/模式），原文可一键撤销 | `node zcode-patcher.js --enhance-btn [--check/--revert]` | app.asar（重打包级：preload IPC×2 + main handler×2 + index.html 挂 zcode-enhance.js） |
+| 增强提示词 | 输入框工具栏「✨ 增强」按钮：把草稿改写为结构化提示词（快捷键 `Ctrl+/`，Mac/Windows/Linux 通用；右键面板可指定模型/模式），原文可一键撤销 | `node zcode-patcher.js --enhance-btn [--check/--revert]` | app.asar（重打包级：preload IPC×2 + main handler×2 + index.html 挂 zcode-enhance.js） |
 | 去额度广告 | 关闭「今日免费计划额度剩余 x%，可升级」骚扰横幅，保留耗尽/受限提示 | `node zcode-patcher.js --quota-banner [--check/--revert]` | app.asar 内渲染文件（同长度原地改字节） |
 
 两个及以上功能可一次执行：`node zcode-patcher.js --usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner`。
@@ -29,6 +30,7 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 - `zcode-patch check` — 各项状态
 - `zcode-patch revert` — 全部还原
 - Windows：五个文件复制到 `%USERPROFILE%\.zcode\patcher\`，一键脚本用仓库内 `scripts\zcode-patch.cmd`（子命令同上：无参 / `check` / `revert` / `-f`；需 Windows 10+，Program Files 安装需管理员终端，打补丁前完全退出 ZCode）
+- **运行检测（sh 版，勿改用 `pgrep -xq ZCode`）**：判据是 `ps -eo comm= | grep -qxE 'ZCode|zcode|.*/(ZCode|zcode)'`。实测 macOS + Electron 41 打包的 ZCode 3.11.x 上 `pgrep -x` **看不见** ZCode 主进程（同一时刻 `ps -eo comm=` 有 `ZCode` 行，`pgrep -x ZCode` 却返回 1），而 `lsappinfo` 只认已登记 bundle 的 App、对在跑的应用也可能返回空（实测 Finder 在跑时输出为空），都不能用来判断。判据要同时认短名与完整路径两种 `comm` 形态，并尾部锚定，才不会命中 `ZCode Helper` / `zcode-cli` / `ZCode Computer Use`。漏报的后果是：守卫误判「未运行」直接开打，asar 被原子替换但运行中的实例仍握着旧 inode（旧代码），收尾的 `open -a ZCode` 只把旧实例切到前台、不会重载 —— 用户以为生效了，实际跑的还是旧代码。
 
 **ZCode 升级后**：官方更新会覆盖 zcode.cjs 与 app.asar、五补丁全失效，跑一次 `zcode-patch -f` 即可；思考等级/TPS 备份检测到升级覆盖会自动刷新为新版原样（还原不降级）。
 
@@ -234,7 +236,7 @@ node zcode-patcher.js --menu-width --revert   # 定点还原（内容寻址，�
 
 ## 二点六、继续按钮（--continue-btn）
 
-输入框工具栏「✨增强」右侧新增「继续」按钮：单击把「继续」填入 composer（已有草稿则空格追加，不丢原文）并立即发送。
+输入框工具栏「✨增强」右侧新增「继续」按钮：单击把「继续」填入 composer（已有草稿则空格追加，不丢原文）并立即发送。快捷键 **`Cmd/Ctrl+Shift+J`**（Continue 的 J，与增强键 `Ctrl+/` 相邻好记），仅输入框聚焦时生效。
 
 ```bash
 node zcode-patcher.js --continue-btn            # 注入（重打包级：index.html 挂载 + 新增脚本条目）
@@ -245,7 +247,8 @@ node zcode-patcher.js --continue-btn --cont-src /path/to/zcode-continue.js   # �
 
 - **提交通路**：composer 是 `<form>`，原生发送按钮即 `type=submit`（`data-testid=chat-send-button`）；脚本优先 `btn.click()` 走与用户点击「↑」完全相同的路径——生成中排队、权限锁定等状态语义全部交给应用自身判断，不绕过任何禁用守卫；按钮 disabled 时中止并提示（已填入的「继续」保留在输入框）。
 - **发送确认**：提交后轮询草稿清空才算成功；未清空降级合成 Enter 兜底一次，再失败 toast 提示手动发送——绝不重复发送。
-- **写入**：与增强按钮同一套已验证 Lexical 通路（聚焦 + execCommand selectAll/insertText，beforeinput 同步内部 state）；内容未确认写入成功绝不触发提交。
+- **写入（v6，与增强按钮同一套模型层通路）**：`__lexicalEditor` 句柄 + `parseEditorState/setEditorState` 整体替换；仅无句柄时回退 DOM 通路（先 `deleteByCut` 确认清空、再逐行填）。旧实现用 `execCommand(selectAll + insertText)` 一次同步写入，在 Lexical 下有三重失败：①全选只覆盖最后一段，多段草稿写不进去；②`execCommand` 之间需要让出事件循环 Lexical 才同步内部选区，同步连发必然被丢弃（实测：`focus→selectAll→insertText` 零等待必失败，每步 `await` 50ms 才成功）；③多段文本里的换行会被吞掉。内容未确认写入成功绝不触发提交。
+- **快捷键**：`Cmd/Ctrl+Shift+J`，document 捕获阶段拦截并 `preventDefault`；只在 composer 聚焦（`activeElement` 是 composer 或其子节点）时生效，组字中（`isComposing`）、按键重复、带 Alt、以及无 Shift/无修饰键的变体全部放行给应用。
 - **挂载位置**：✨增强按钮右侧（红框位）；✨ 不存在时挂「完全访问」容器末尾。与 TPS 胶囊共存：enhance 脚本对胶囊的邻接强制已放宽为「在胶囊之前即可」（需重跑 `--enhance-btn` 升级注入），三个注入脚本互不搬移。
 - **幂等/升级**：已打 = tag + 条目 + 条目与注入源逐字节一致；`zcode-continue.js` 更新后重跑即原地升级。还原精确 strip 自身 tag；脚本条目仅在与注入记录一致时删除。sidecar `app.asar.continue-patch.json` 记录脚本指纹，重打包后随 `refreshSidecarsAfterRepack` 自动刷新。
 
@@ -279,7 +282,7 @@ node zcode-patcher.js --tps-footer --tps-src /path/to/zcode-tps.js   # 指定注
 
 ### 数据链路原理（无常驻服务）
 
-1. ZCode 桌面端 preload 把主进程的 MessagePort 经 `window.postMessage("zcode:service-port", "*", [port])` 转交渲染页面；注入脚本监听该事件接管端口（`window.__ztpsHook` 可对存量端口手动补挂，`window.__ztpsPort` 暴露端口供调试旁路监听）。
+1. ZCode 桌面端 preload 把主进程的 MessagePort 经 `window.postMessage` 转交渲染页面；注入脚本监听该事件接管端口（`window.__ztpsHook` 可对存量端口手动补挂，`window.__ztpsPort` 暴露端口供调试旁路监听）。消息形态两代都要认：旧 preload 为裸字符串 `"zcode:service-port"`；新 preload（u3+）为对象 `{ type: "zcode:service-port", databaseStartupId }`（主会话端口）与 `{ type: "zcode:scoped-service-port", attachmentId, sessionId, target }`（远程 workspace 端口）。只认旧形态时主会话端口会静默漏接——turns 恒空，统计栏永不出现。
 2. 会话协议帧为二进制（Uint8Array）内嵌 JSON（自首个 `{` 起），两类：
    - **version:1 事件流**（顶层带 sessionId/sourceCommandId/occurredAt）：`usage.delta`（inputTokens/outputTokens/cacheReadTokens/totalTokens/reasoningTokens，**每次模型请求完成时发**——一轮含工具调用会有多条，out 为该次请求输出）、`stream.chunk`（`assistantMessageId` + `chunkLength` + `channel`，流式期间每 50-100ms 一批）
    - **conversation 行事件**（`frame.payload.deltas`/`events`）：`turnHeader`（startedAt/endedAt/state）、`userInput`（createdAt）、`reasoning`/`assistantText`（`text` 全量 + `assistantResponseId`）、`row.delta`（`{rowId, path:"text", append:"文本增量"}`）
@@ -356,7 +359,9 @@ node zcode-patcher.js --modelhub --revert   # 定点还原
 - **渠道回退原因**：官方 plan 渠道（`zcode.z.ai`）有请求签名 + PoW + 阿里云 captcha 三层网关校验（内核 `X-Client-Sig`/`X-Client-Pow` 体系），纯直连必被 `HTTP 400 code:3007` 拦截且无法复刻——因此增强链路对 `builtin:` 官方渠道做**三层屏蔽**：自动评分链整体排除、面板不列出、面板指定路径（含 localStorage 旧残留）同样拒绝；增强流量只会落到手配的自定义渠道。
 - **模型/模式选择面板（v5，右键 ✨）**：面板实时列出 config.json 全部启用的自定义渠道（`builtin:` 官方渠道不列出；评分排序，标注协议/★当前渠道/无凭据）与渠道内全部模型（按 `zcode.priority` 降序，P 值标注），顶部切简洁/创意模式，另有「自动」档清除指定；enhance-config.json 手动条目以提示行展示。点击模型即指定并持久化（localStorage `zcode-enhance-model`），选择优先级：**面板指定 > enhance-config.json 手动配置 > 渠道评分链**；指定的渠道/模型在 config 中失效（被删/禁用/属 `builtin:` 官方渠道）时自动回退评分链——主进程拒绝指定、面板打开时顺手清掉失效指定并 toast 提示，toast 以实际使用的 model 为准。面板数据经新增 IPC `zcode-enhance:list-models` 实时读盘（改 config 即点即生效，无需重启）。preload 升级为四参转发 `(text, mode, channel, model)`——旧版单参 preload 会丢弃后三个参数；渲染端以 `enhanceListModels` 是否暴露判新版（contextBridge 包装的函数 `.length` 恒为 0，早期 `.length` 检测必误报「旧版」，勿再使用），判旧时在面板与 toast 中提示重打。
 - **引擎**：主进程实现 `zcode-enhance:run`（改写）与 `zcode-enhance:list-models`（面板数据）两个 IPC handler，均实时读盘：读 `~/.zcode/v2/config.json` + `setting.json`（`modelProviderFamilySelectedKeys` 解析当前渠道，兼容 `family:builtin:xxx` 多段前缀）与 `enhance-config.json`；anthropic 协议走 `{baseURL}/v1/messages`，openai 系走 `/v1/chat/completions`；max_tokens 简洁 4096 / 创意 16384，45s 超时，429 重试一次。
-- **交互**：空草稿 toast 提示；单击增强（按钮转「增强中…」），**右键**打开模型/模式选择面板；结果**替换输入框内容**（Lexical 编辑器，写入走 execCommand 由 Lexical beforeinput 同步内部 state），原文进撤销栈，toast「点击撤销」8 秒内可还原；失败 toast 错误详情。
+- **交互**：空草稿 toast 提示；单击增强（按钮转「增强中…」）、或按快捷键 **`Ctrl+/`**（仅输入框聚焦时生效），**右键**打开模型/模式选择面板；结果**替换输入框内容**，原文进撤销栈，toast「点击撤销」8 秒内可还原；失败 toast 错误详情。
+- **快捷键（v6）**：`Ctrl+/`——**Mac 与 Windows/Linux 都用 Ctrl**，没有平台分支（未采用 `Cmd+/`：应用已把 `Cmd` 系留给自身，且 Mac 上再多一把同义键反而增加冲突面）。判定只看 `ev.key === "/"` + `ctrlKey`，**不看 `code`/`keyCode`**，因为 `ev.key` 是「按当前布局实际打出的字符」：德语区 / 法语 AZERTY 等布局上 `/` 本身要 Shift 才打得出来，用 `code === 'Slash'` 判定会在这些键盘上完全按不动（实测 DE `Ctrl+Shift+7`、FR `Ctrl+Shift+-` 的 `key` 都是 `/`）。放开 shift 不会引入歧义：US 布局上 `Ctrl+Shift+/` 打出的是 `?`，字符不符直接不命中。`/` 是输入框里触发应用「能力菜单」的字符，所以只在 composer 聚焦时（`activeElement` 为 composer 或其子节点）于 document 捕获阶段拦截，并 `preventDefault` + `stopPropagation`，既不吞掉其他位置的组合键，也不让 `/` 漏进草稿或弹出能力菜单。组字中（`isComposing`）、按键重复、带 `Cmd`/`Alt` 的变体、以及选模型面板打开时一律放行；`ev.defaultPrevented` 已为真时同样让路（应用先处理了就不抢）。选键位时排除了 `Cmd+J`（应用未绑定但易误按）与 `Cmd+K`（终端已占用）。
+- **写回实现（v6，修「偶尔不清空 / 直接叠加」）**：正常通路直接操作 Lexical 模型层——根 DOM 上的 `__lexicalEditor` 句柄 + `parseEditorState(按 \n 切成 paragraph 的状态)` + `setEditorState()` 做**一次性原子替换**（清空旧稿与写入新稿是同一个状态切换，不存在中间态；状态 JSON 与编辑器自身 `toJSON` 同构），随后 `editor.focus()` 并把 DOM 光标补到末尾，用户接着打字不丢焦点。仅在拿不到句柄或模型层写入抛错时才回退 DOM 通路，回退里「先确认清空、再逐行填」各自校验，任一步不确认即报失败走剪贴板兜底，**绝不把新文本叠在残留旧稿上**。旧实现（v5 及之前）默认用 `execCommand('selectAll' + 'insertText')` 做替换，但 `execCommand` 的全选只把浏览器选区落在**最后一段文本节点**（`0..该段长度`）：单段草稿看不出问题，多段草稿只删掉最后一段，其余段落被随后的插入顶走，于是出现「清不干净 / 覆盖混乱」。同因，回退通路的删除改用 `deleteByCut` 的 beforeinput（Lexical 唯一转成 REMOVE_TEXT、真删选区且能跨段的输入类型；`deleteContent` 只删单字符），填入按行发 `insertParagraph` 的 beforeinput（Lexical 忽略 `execCommand('insertParagraph')`）。草稿读取也优先走模型层（`getEditorState().toJSON()` 还原段落换行），与 DOM `textContent` 归一后不一致才回退 DOM 读法（遇到 mention 等非文本节点时更保守）。
 - **注入四点**：preload 暴露 `enhancePromptDraft` + `enhanceListModels` IPC（双形态锚点：原生或 modelhub 已打后形态，恰一命中）、main 尾部追加 `zcode-enhance:list-models` + `zcode-enhance:run` handler（仅 run 收尾使用边界标记，list 刻意异串防误配）、index.html 挂 `zcode-enhance.js`、asar 新增该脚本条目。**原地升级**：apply 自动剥离旧版注入（旧 preload 串存载荷 `ENH_PRELOAD_INJECT_V1` 兜底）后按当前载荷重注入，旧版存量与 partial 状态无需先 revert；「已打跳过」仅在主块与当前载荷、注入脚本与源文件**逐字节一致**时生效——载荷或 zcode-enhance.js 更新后重跑 `--enhance-btn` 即原地升级（`--check` 标注「载荷/脚本有更新」）；revert 的 main 移除为边界式（import 行起、catch-return 止，含旧版块尾换行剥离），与载荷版本无关。
 - **还原 = 全精确反向替换**（不依赖 sidecar 字节），与 modelhub/TPS 任意安装、还原顺序互不踩踏。
 - 配套加固：TPS revert 改为 strip 自身 tag 优先；modelhub revert 改为精确反向替换优先（apply 时在 sidecar 记录 STICKY 注入点后文 32 字节用于定位，注意注入点从 STICKY_OLD 位置推导而非 `indexOf(STICKY_NEW)`——后者会命中文件里 300+ 处自然出现的第一个）。

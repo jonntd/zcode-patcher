@@ -1,8 +1,16 @@
 /**
- * ZCode TPS Footer v1.0.4 —— 输入框工具栏统计胶囊（无常驻服务）
+ * ZCode TPS Footer v1.1.3 —— 输入框工具栏统计胶囊（无常驻服务）
  * 当前会话最近一轮: ● 时间 · 首 token Xs · X tok/s · out X（生成中实时刷新）
+ * v1.1.3: 缓存命中率三级回退（官方面板真值 → 本轮 cacheRead/input → 会话累计），
+ *   修第三方模型（openai 兼容）缓存不显示：其 usage.delta 自带 cacheReadTokens
+ *   （内核把 prompt_tokens_details.cached_tokens 映射进来），但旧逻辑只有会话累计
+ *   兜底且需跨轮才有值。另加 window.__ztpsFrames 环形缓冲（50 帧）供诊断取数。
+ * v1.1.2: hookPort 不再主动 port.start()。3.12.x 主界面启动握手依赖端口首批帧，
+ *   提前 start 会把 app 尚未监听的初始帧派发掉 → app 卡死在启动 logo、胶囊也无数据。
  *
- * 数据源: 页面内 MessagePort 会话事件流（preload 转交的 zcode:service-port）
+ * 数据源: 页面内 MessagePort 会话事件流（preload 转交的 zcode:service-port；
+ *   消息形态新旧两代都要认：裸字符串 "zcode:service-port"，或新版 preload 的
+ *   对象 { type: "zcode:service-port", databaseStartupId }）
  *   - conversation 行事件: turnHeader / userInput / reasoning / assistantText / row.delta(文本增量)
  *   - version:1 事件流: usage.delta(精确 usage，每次模型请求完成时发) / stream.chunk(首块+心跳)
  * 指标口径:
@@ -49,6 +57,7 @@
     t.firstChunkAt = null; t.rowFirstAt = null; t.lastUsageAt = null;
     t.outputTokens = 0; t.inputTokens = 0; t.cacheReadTokens = 0; t.totalTokens = 0;
     t.textTok = 0; t.win = []; t.lastTps = null; t.streaming = true;
+    t.turnCache = null;   // 轮复用（编辑重发）时旧命中率不残留
   }
 
   // token 粗估：CJK 字符 1 字 ≈ 1 token，其余 4 字符 ≈ 1 token
@@ -117,6 +126,9 @@
       sessUsage.inputTokens += ev.inputTokens || 0;
       sessUsage.cacheReadTokens += ev.cacheReadTokens || 0;
       sessUsage.requests += 1;
+      // 本轮命中率（openai 兼容供应商的 cached_tokens 经内核映射进 cacheReadTokens，
+      // inputTokens 为含缓存的总 prompt——与官方「平均缓存命中率」同口径的轮级真值）
+      t.turnCache = t.inputTokens > 0 ? t.cacheReadTokens / t.inputTokens : null;
       t.modelId = ev.modelId || t.modelId;
       t.sessionId = ev.sessionId || t.sessionId;
       t.lastUsageAt = ev.occurredAt ?? t.lastUsageAt;
@@ -163,6 +175,14 @@
       const i = txt.indexOf("{");
       if (i < 0) return;
       const j = JSON.parse(txt.slice(i));
+      // 诊断环形缓冲：最近 50 帧（含 usage/cache 字段形态），控制台直接查
+      // window.__ztpsFrames —— 第三方模型缓存不显示时先看这里有没有 usage.delta
+      try {
+        (window.__ztpsFrames = window.__ztpsFrames || []).push(
+          j.version === 1 ? { v: 1, kind: j.kind, scid: j.sourceCommandId, in: j.inputTokens, cr: j.cacheReadTokens }
+            : { kind: j.type || j.op || "frame", hasUsage: !!(j.patch?.usage || j.snapshot?.usage), usage: j.patch?.usage ?? j.snapshot?.usage ?? null });
+        if (window.__ztpsFrames.length > 50) window.__ztpsFrames.splice(0, window.__ztpsFrames.length - 50);
+      } catch { /* 静默 */ }
       if (j.version === 1) { onEvent(j); return; }
       if (j.type === "state.updated") absorbOfficial(j.sessionId ?? null, j.patch && j.patch.usage);
       absorbOfficial(j.sessionId ?? null, j.snapshot && j.snapshot.usage);
@@ -223,12 +243,15 @@
       if (tps == null && t.lastTps != null) tps = t.lastTps;
     }
     if (tps != null) t.lastTps = tps;
-    // 命中率真值：优先官方面板同源数据(按轮次所属会话取，未关联时取最近更新的)；真值未到达才用本地累计兜底
+    // 命中率三级回退：① 官方面板同源真值(按轮次所属会话取，未关联时取最近更新的)
+    // ② 本轮 cacheRead/input（第三方 openai 兼容模型的 timely 真值，usage.delta 即到即显）
+    // ③ 会话累计兜底。展示最多 1 位小数(整数不带 .0)。
     let oc = t.sessionId != null ? official.get(t.sessionId) : null;
     if (!oc) for (const v of official.values()) if (!oc || v.at > oc.at) oc = v;
-    // 展示口径：会话累计平均命中率(hitRate)，与官方「平均缓存命中率」面板同源同值；最多 1 位小数(整数不带 .0)
     const ocHit = oc && Number.isFinite(oc.cache.hitRate) ? oc.cache.hitRate : null;
+    const turnHit = Number.isFinite(t.turnCache) ? t.turnCache : null;
     const cache = Number.isFinite(ocHit) ? Math.round(ocHit * 1000) / 10
+      : turnHit != null ? Math.round(turnHit * 1000) / 10
       : sessUsage.inputTokens > 0 ? Math.round(sessUsage.cacheReadTokens * 1000 / sessUsage.inputTokens) / 10 : null;
     return {
       stamp: fmtStamp(t.endedAt || t.startedAt), ttft, tps, out, cache,
@@ -240,15 +263,50 @@
 
   // ---------- 渲染 ①: 输入框工具栏中央（当前会话最近一轮） ----------
   function findToolbarRow() {
-    const ta = document.querySelector("[data-testid='v4-composer-input']");
+    // 多级锚点：新版(u3+) 输入框在 .chat-composer-input-surface 组件内、发送钮 data-testid
+    // 为 chat-send-button；旧版是 data-testid="v4-composer-input"。全部探测，兜底到页面上
+    // 唯一可见的大输入框（textarea / contenteditable），保证结构改版时功能不消失。
+    const NEW_TA = [
+      ".chat-composer-input-surface textarea",
+      ".chat-composer-input-surface [contenteditable='true']",
+      "[data-testid='chat-input']",
+    ];
+    const OLD_TA = "[data-testid='v4-composer-input']";
+    const ta = NEW_TA.map((s) => document.querySelector(s)).find(Boolean)
+      || document.querySelector(OLD_TA)
+      || null;
     if (!ta) return null;
-    const card = ta.closest("form") ? ta.closest("form").parentElement : ta.parentElement;
-    if (!card) return null;
-    for (const el of card.querySelectorAll("div")) {
-      const c = el.className || "";
-      if (/flex[^"]*items-end/.test(c) && (el.textContent || "").includes("完全访问")) return el;
+    const form = ta.closest("form");
+    // 新版工具栏行可能在 form 内部、form 外层（form 上部子容器）。候选取
+    // 输入框自身到 form 祖先的整条链，再综合评分挑最像工具栏的。
+    const scope = form ? (form.parentElement || form) : ta.parentElement;
+    if (!scope) return null;
+    const candidates = [];
+    const collect = (n) => {
+      for (const d of n.querySelectorAll("div")) { candidates.push(d); if (candidates.length > 400) return; }
+    };
+    collect(scope);
+    // 工具栏容器（含发送/触发器按钮组）不一定贴着 form，往上多爬两级（新版结构）风险小
+    for (let up = scope.parentElement, i = 0; up && i < 2; up = up.parentElement, i++) {
+      collect(up);
     }
-    return null;
+    candidates.unshift(scope);
+    // 优先找真正的工具栏：按钮/输入控件比固定文案更稳定，完全访问仅作旧版回退。
+    const scored = candidates.map((el) => {
+      const text = el.textContent || "";
+      const cls = String(el.className || "");
+      let score = 0;
+      if (/flex/.test(cls)) score += 1;
+      if (/items-(end|center)/.test(cls)) score += 1;
+      if (el.querySelector("button,[role='button']")) score += 2;
+      if (el.querySelector(
+        "[data-testid*='send'],[data-testid*='toolbar'],[data-chat-toolbar-popover-trigger='true'],#zcode-enhance-btn,#zcode-continue-btn",
+      )) score += 4;
+      if (el.querySelector("[data-chat-toolbar-popover-trigger='true']")) score += 2;
+      if (text.includes("完全访问")) score += 3;
+      return { el, score };
+    }).filter((x) => x.score >= 3).sort((a, b) => b.score - a.score);
+    return scored[0]?.el || null;
   }
 
   function renderBar() {
@@ -270,11 +328,17 @@
         if (el) domSess = el.getAttribute("data-session-id");
       }
       const visible = new Set();
-      document.querySelectorAll("section[data-turn-id]").forEach((el) => visible.add(el.getAttribute("data-turn-id")));
+      document.querySelectorAll("[data-turn-id],[data-message-id],[data-assistant-message-id]").forEach((el) => {
+        ["data-turn-id", "data-message-id", "data-assistant-message-id"].forEach((key) => {
+          const id = el.getAttribute(key);
+          if (id) visible.add(id);
+        });
+      });
       let latest = null;
       for (const t of turns.values()) {
-        if (!visible.has(t.msgId)) continue;
-        // 轮次归属会话与当前显示会话不符时排除（会话切换的 DOM 中间态残留兜底）
+        // 新版 DOM 可能不再把 turn id 放在 section 上；有可见标记时严格匹配，
+        // 没有标记时允许仍在生成/刚结束的最近一轮作为兜底，避免胶囊因结构改版消失。
+        if (visible.size && !visible.has(t.msgId)) continue;
         if (t.sessionId && domSess && t.sessionId !== domSess) continue;
         if (!latest || (t.startedAt ?? 0) > (latest.startedAt ?? 0)) latest = t;
       }
@@ -303,10 +367,14 @@
           border: "1px solid var(--color-border, transparent)",
           padding: "0 12px",
         });
-        // 挂到中组容器末尾（「完全访问 ▾」之后）；✨ 存在时保持 [✨, 胶囊] 顺序
+        // 挂到中组容器末尾；✨ 存在时保持 [✨, 胶囊] 顺序。
+        // 新版工具栏是 popover 触发器组（data-chat-toolbar-popover-trigger），旧版是「完全访问 ▾」，
+        // 都找不到时插到行首按钮组后面（row.children[1]），不影响发送按钮。
         let mid = null;
         for (const el of row.children) {
-          if ((el.textContent || "").includes("完全访问")) { mid = el; break; }
+          const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
+            || el.querySelector("[data-testid*='toolbar'],[data-testid*='send']");
+          if ((el.textContent || "").includes("完全访问") || isToolbarGroup) { mid = el; break; }
         }
         if (!mid) {
           row.insertBefore(host, row.children[1] || null);
@@ -314,7 +382,7 @@
           const enh = mid.querySelector("#zcode-enhance-btn");
           if (enh) {
             if (enh.nextSibling !== host) mid.insertBefore(host, enh.nextSibling);
-          } else if (host.parentNode !== mid) {
+          } else if (host.parentNode !== mid && !mid.querySelector("[data-ztps-bar]")) {
             mid.appendChild(host);
           }
         }
@@ -407,17 +475,30 @@
   else document.addEventListener("DOMContentLoaded", start);
 
   // ---------- 端口获取 ----------
+  // 3.12.x 起主界面启动握手依赖端口的「首批帧」：这里绝不能主动 port.start()——
+  // 提前 start 会把队列里 app 尚未挂监听的初始帧派发给（几乎空手的）本脚本，
+  // app 永远等不到握手帧，整个界面卡死在启动 logo（root-startup-loading）。
+  // 正常路径：本脚本先挂监听但不 start；app 自己 onmessage/addEventListener 会
+  // 隐式/显式 start，届时积压帧一并派发给所有监听者，双方数据完整。
+  // 兜底：若 10s 内一帧未到（app 一直不消费该端口），才主动 start——此刻 app
+  // 没有监听，不存在偷帧问题，与旧行为等价。
   function hookPort(port) {
     if (!port || port.__ztps) return;
     port.__ztps = true;
-    port.addEventListener("message", (ev) => handleFrame(ev.data));
-    port.start();
+    let gotAny = false;
+    port.addEventListener("message", (ev) => { gotAny = true; handleFrame(ev.data); });
+    if (typeof setTimeout === "function") setTimeout(() => { if (!gotAny) { try { port.start(); } catch { /* 静默 */ } } }, 10000);
     window.__ztpsPort = port;   // 调试用：暴露端口供旁路监听原始帧
   }
   window.addEventListener("message", (e) => {
     if (e.source !== window) return;
     const d = e.data;
-    if (d === "zcode:service-port" || (d && d.type === "zcode:scoped-service-port")) {
+    // 端口消息两种形态都要认，缺一即「统计栏永不出现」（turns 恒空）：
+    //   旧 preload: 裸字符串 "zcode:service-port"
+    //   新 preload: 对象 { type: "zcode:service-port", databaseStartupId }（主会话端口）
+    //               对象 { type: "zcode:scoped-service-port", attachmentId, sessionId, target }（远程 workspace 端口）
+    const type = d && typeof d === "object" ? d.type : null;
+    if (d === "zcode:service-port" || type === "zcode:service-port" || type === "zcode:scoped-service-port") {
       if (e.ports && e.ports[0]) hookPort(e.ports[0]);
     }
   }, true);

@@ -154,7 +154,21 @@ func main() {
 	default:
 		entry = filepath.Join(unpackDir, "zcode-patcher.js") // CLI passthrough
 	}
-	args := append([]string{entry}, os.Args[1:]...)
+	// -f / --force 只属于编排层（守卫 + 优雅退出 + 拉起），引擎不认识这个 flag，
+	// 透传前必须剥掉。
+	force := false
+	args := make([]string, 0, len(os.Args))
+	for _, a := range os.Args[1:] {
+		if a == "-f" || a == "--force" {
+			force = true
+			continue
+		}
+		args = append(args, a)
+	}
+	if code, handled := orchestrateApplyAll(rt, args, force); handled {
+		os.Exit(code)
+	}
+	args = append([]string{entry}, args...)
 	os.Exit(runChild(rt.bin, args, env))
 }
 

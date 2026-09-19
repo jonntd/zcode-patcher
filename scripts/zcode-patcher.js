@@ -70,6 +70,7 @@
  */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
@@ -166,10 +167,12 @@ function entryIntegrity(data, blockSize = 4194304) {
  * 全部条目 offset 重排；写临时文件、回读校验后原子替换。返回新文件大小。
  * 关键坑（改本函数前必读）：offset 重排会直接改写条目，此后从旧文件切片必须用
  * 重排前快照的旧位置；新增条目的树插入必须在重排前完成。
+ * @param {object} [state] 复用调用方已持有的 {raw,header,dataStart}（MemAsar 批量模式），
+ *                 传了就不再整读一遍原文件。
  */
-function repackAsar(asar, overwrite, remove, tmpSuffix = ".tps-tmp") {
-  const state = asarOpen(asar);
-  const { raw, header, dataStart } = state;
+function repackAsar(asar, overwrite, remove, tmpSuffix = ".tps-tmp", state) {
+  const S = state || asarOpen(asar);
+  const { raw, header, dataStart } = S;
 
   // overwrite 中树里尚不存在的路径（新增文件）按层级插入占位条目
   for (const p of Object.keys(overwrite)) {
@@ -256,17 +259,29 @@ function repackAsar(asar, overwrite, remove, tmpSuffix = ".tps-tmp") {
   emit(header, "");
   fs.writeFileSync(tmp, Buffer.concat(out));
 
-  // 回读校验：重开临时文件，逐条比对 overwrite 条目字节
-  const vState = asarOpen(tmp);
-  const vFiles = new Map(walkEntries(vState.header).map((x) => [x.path, x.ent]));
+  // 回读校验：只读 tmp 的头部与 overwrite 条目所在区段（307MB 级 asar 整读一遍太浪费）
   try {
-    for (const [p, want] of Object.entries(overwrite)) {
-      const ent = vFiles.get(p);
-      if (!ent) throw new Error(`重打包校验失败（条目缺失）: ${p}`);
-      const got = entryBytes(vState, ent);
-      if (got.length !== want.length || !got.equals(want)) {
-        throw new Error(`重打包校验失败: ${p}`);
+    const fd = fs.openSync(tmp, "r");
+    try {
+      const head = Buffer.alloc(16);
+      fs.readSync(fd, head, 0, 16, 0);
+      const vDataStart = 8 + head.readUInt32LE(4);
+      const vJsonLen = head.readUInt32LE(12);
+      const vHeaderBuf = Buffer.alloc(vJsonLen);
+      fs.readSync(fd, vHeaderBuf, 0, vJsonLen, 16);
+      const vHeader = JSON.parse(vHeaderBuf.toString("utf8"));
+      const vFiles = new Map(walkEntries(vHeader).map((x) => [x.path, x.ent]));
+      for (const [p, want] of Object.entries(overwrite)) {
+        const ent = vFiles.get(p);
+        if (!ent) throw new Error(`重打包校验失败（条目缺失）: ${p}`);
+        const got = Buffer.alloc(ent.size);
+        fs.readSync(fd, got, 0, ent.size, vDataStart + Number(ent.offset));
+        if (got.length !== want.length || !got.equals(want)) {
+          throw new Error(`重打包校验失败: ${p}`);
+        }
       }
+    } finally {
+      fs.closeSync(fd);
     }
   } catch (e) {
     rmQuiet(tmp);
@@ -276,92 +291,141 @@ function repackAsar(asar, overwrite, remove, tmpSuffix = ".tps-tmp") {
   return fs.statSync(asar).size;
 }
 
-/** 重打包后数据区位移/尺寸变化：
- *  - chart sidecar：记录含绝对 offset，按 path+size 重定位 offset 与 asar_size 指纹；
- *  - modelhub / TPS sidecar：按 path 记录原始字节、无 offset，只把 asar_size 指纹
- *    刷新到当前值，避免其它补丁重打包后记录被当作失配作废。 */
+/** 重打包后数据区位移/尺寸变化：注册表驱动——新增 sidecar 类型时在 SIDECAR_REFRESHERS
+ *  加一项，别往流程里堆 if。忘记登记＝重打包后该补丁的记录被静默作废（offset 失配、
+ *  asar_size 指纹对不上被当作旧版本清零），正是「升级悄悄抹补丁」这类 bug 的温床。
+ *  - chart：记录含绝对 offset，按 path+size 重定位 offset 与 asar_size 指纹；
+ *  - 其余（modelhub/tps/continue/menuwidth/quota）：只把 asar_size 指纹刷到当前值。 */
+const SIDECAR_REFRESHERS = [
+  {
+    side: (asar) => asar + ".chart-patch.json",
+    refresh(rec, entries, cur, dataStart, side) {
+      let changed = false;
+      for (const r of rec.patches || []) {
+        const ent = entries.get(r.path);
+        // chart 记录的 offset 是绝对文件偏移（dataStart+相对），重定位时必须换算成绝对
+        const abs = dataStart + Number(ent ? ent.offset : -1);
+        if (ent && ent.size === r.size && (abs !== r.offset || r.asar_size !== cur)) {
+          r.offset = abs;
+          r.asar_size = cur;
+          changed = true;
+        }
+      }
+      if (changed) {
+        writeJson(side, { patches: rec.patches });
+        return `[*] 已同步 ${path.basename(side)} 的 offset/指纹到重打包后的 asar`;
+      }
+      return null;
+    },
+  },
+  {
+    side: (asar) => asar + ".modelhub-patch.json",
+    refresh(rec, entries, cur, dataStart, side) {
+      const files = rec.files || [];
+      if (rec.asar_size !== cur && files.length && files.every((f) => entries.get(f.path))) {
+        rec.asar_size = cur;
+        writeJson(side, rec);
+      }
+      return null;
+    },
+  },
+  fingerprintRefresher(".tps-patch.json", "index_path"),
+  fingerprintRefresher(".continue-patch.json", "index_path"),
+  fingerprintRefresher(".menuwidth-patch.json", "path"),
+  fingerprintRefresher(".quota-patch.json", "path"),
+];
+
+/** 只刷 asar_size 指纹的 sidecar：校验 path 字段对应条目仍存在才动手。 */
+function fingerprintRefresher(suffix, pathKey) {
+  return {
+    side: (asar) => asar + suffix,
+    refresh(rec, entries, cur, dataStart, side) {
+      if (rec.asar_size !== cur && rec[pathKey] && entries.get(rec[pathKey])) {
+        rec.asar_size = cur;
+        writeJson(side, rec);
+      }
+      return null;
+    },
+  };
+}
+
 function refreshSidecarsAfterRepack(asar) {
   const state = asarOpen(asar);
   const entries = new Map(walkEntries(state.header).map((x) => [x.path, x.ent]));
   const cur = fs.statSync(asar).size;
-
-  const dataStart = state.dataStart;
-  const chartSide = asar + ".chart-patch.json";
-  if (fs.existsSync(chartSide)) {
-    let recs = [];
-    try { recs = readJson(chartSide).patches || []; } catch { recs = []; }
-    let changed = false;
-    for (const r of recs) {
-      const ent = entries.get(r.path);
-      // chart 记录的 offset 是绝对文件偏移（dataStart+相对），重定位时必须换算成绝对
-      const abs = dataStart + Number(ent ? ent.offset : -1);
-      if (ent && ent.size === r.size && (abs !== r.offset || r.asar_size !== cur)) {
-        r.offset = abs;
-        r.asar_size = cur;
-        changed = true;
-      }
-    }
-    if (changed) {
-      writeJson(chartSide, { patches: recs });
-      console.log(`[*] 已同步 ${path.basename(chartSide)} 的 offset/指纹到重打包后的 asar`);
-    }
-  }
-
-  const mhSide = asar + ".modelhub-patch.json";
-  if (fs.existsSync(mhSide)) {
+  for (const r of SIDECAR_REFRESHERS) {
+    const side = r.side(asar);
+    if (!fs.existsSync(side)) continue;
     try {
-      const rec = readJson(mhSide);
-      const files = rec.files || [];
-      if (rec.asar_size !== cur && files.length && files.every((f) => entries.get(f.path))) {
-        rec.asar_size = cur;
-        writeJson(mhSide, rec);
-      }
+      const rec = readJson(side);
+      const msg = r.refresh(rec, entries, cur, state.dataStart, side);
+      if (msg) console.log(msg);
     } catch { /* 静默 */ }
   }
+}
 
-  const tpsSide = asar + ".tps-patch.json";
-  if (fs.existsSync(tpsSide)) {
-    try {
-      const rec = readJson(tpsSide);
-      if (rec.asar_size !== cur && rec.index_path && entries.get(rec.index_path)) {
-        rec.asar_size = cur;
-        writeJson(tpsSide, rec);
-      }
-    } catch { /* 静默 */ }
-  }
+// ---------------------------------------------------------------- asar 内存态（批量合并落盘）
 
-  const contSide = asar + ".continue-patch.json";
-  if (fs.existsSync(contSide)) {
-    try {
-      const rec = readJson(contSide);
-      if (rec.asar_size !== cur && rec.index_path && entries.get(rec.index_path)) {
-        rec.asar_size = cur;
-        writeJson(contSide, rec);
-      }
-    } catch { /* 静默 */ }
+/** 内存态 asar：打开一次、多个补丁共享读取，覆写/删除在内存叠加，最后 flush 一次性
+ *  落盘——一键全打从「N 次全量重写 307MB」合并为 1 次的关键。
+ *  读取语义：set 过的条目返回覆写字节（后续补丁看到的正是前一补丁的产物，与逐个
+ *  顺序执行字节一致）；未动过的条目返回原文件切片（零拷贝）。flush 后实例作废
+ *  （repackAsar 会原地改写 header 树）。
+ *  约定：deferSide 登记的回调在 flush 成功后以新文件大小执行（sidecar 里要写 asar_size）。 */
+function memAsarOpen(asar) {
+  const raw = fs.readFileSync(asar);
+  if (raw.length < 16 || raw.readUInt32LE(0) !== 4) die(`asar 头格式不符: ${asar}`);
+  const headerSize = raw.readUInt32LE(4);
+  let header;
+  try {
+    header = JSON.parse(raw.subarray(16, 16 + raw.readUInt32LE(12)).toString("utf8"));
+  } catch (e) {
+    die(`asar 头 JSON 解析失败: ${asar}`);
   }
-
-  const mwSide = asar + ".menuwidth-patch.json";
-  if (fs.existsSync(mwSide)) {
-    try {
-      const rec = readJson(mwSide);
-      if (rec.asar_size !== cur && entries.get(rec.path)) {
-        rec.asar_size = cur;
-        writeJson(mwSide, rec);
+  const dataStart = 8 + headerSize;
+  const entries = new Map(walkEntries(header).map((x) => [x.path, x.ent]));
+  const overrides = new Map();   // path -> Buffer（覆写/新增）| null（删除）
+  const deferredSides = [];
+  let dirty = 0;
+  const mem = {
+    asar,
+    get(p) {
+      if (overrides.has(p)) {
+        const b = overrides.get(p);
+        if (b == null) die(`条目 ${p} 已被本次流程删除却又被读取——补丁间顺序冲突`);
+        return b;
       }
-    } catch { /* 静默 */ }
-  }
-
-  const qbSide = asar + ".quota-patch.json";
-  if (fs.existsSync(qbSide)) {
-    try {
-      const rec = readJson(qbSide);
-      if (rec.asar_size !== cur && entries.get(rec.path)) {
-        rec.asar_size = cur;
-        writeJson(qbSide, rec);
+      const ent = entries.get(p);
+      if (!ent) return null;
+      const off = dataStart + Number(ent.offset);
+      return raw.subarray(off, off + ent.size);
+    },
+    has(p) { return overrides.has(p) ? overrides.get(p) != null : entries.has(p); },
+    each(fn) { for (const [p, ent] of entries) fn(p, ent); },
+    set(p, buf) { if (!overrides.has(p)) dirty++; overrides.set(p, buf); },
+    del(p) { if (!overrides.has(p)) dirty++; overrides.set(p, null); },
+    dirtyCount: () => dirty,
+    deferSide(fn) { deferredSides.push(fn); },
+    flush(tmpSuffix) {
+      if (!dirty) {
+        for (const fn of deferredSides) fn(fs.statSync(asar).size);
+        deferredSides.length = 0;
+        return fs.statSync(asar).size;
       }
-    } catch { /* 静默 */ }
-  }
+      const overwrite = {}, remove = new Set();
+      for (const [p, b] of overrides) {
+        if (b == null) remove.add(p);
+        else overwrite[p] = b;
+      }
+      const newSize = repackAsar(asar, overwrite, remove, tmpSuffix, { raw, header, dataStart });
+      refreshSidecarsAfterRepack(asar);
+      for (const fn of deferredSides) fn(newSize);
+      deferredSides.length = 0;
+      dirty = 0;
+      return newSize;
+    },
+  };
+  return mem;
 }
 
 // ---------------------------------------------------------------- 思考等级补丁
@@ -573,6 +637,7 @@ function resolveTarget(arg) {
     if (!found.length) die("未探测到任何 ZCode 安装；请把安装目录路径作为参数传入");
     return found;
   }
+  if (/zcode\.cjs$/i.test(arg) && fs.existsSync(arg) && fs.statSync(arg).isFile()) return [arg];
   const roots = /\.app$/i.test(path.basename(arg)) ? [arg, path.join(arg, "Contents")] : [arg];
   for (const root of roots) {
     const cjs = path.join(root, "resources", "glm", "zcode.cjs");
@@ -609,7 +674,14 @@ function processEffort(target, checkOnly, revert) {
     }
     return;
   }
-  if (checkOnly) return;
+  if (checkOnly) {
+    const knownOff = Object.values(ANCHORS).every((a) => countBytes(data, Buffer.from(a, "utf8")) === 0);
+    if (knownOff && !hasMarker) {
+      console.log("    [i] 3.12.x 内核已移除档位换算函数（providerOptionsByLevel 仅存 schema、零运行时读取），本补丁在该内核不适用。");
+      console.log("    [i] 原生替代：设置 → 模型设置 → 该模型的「推理档位映射」，按档位直接映射任意配置路径（等价于本补丁的可视化版）。");
+    }
+    return;
+  }
   if (hasMarker) { console.log("    [=] 已打过补丁，跳过"); return; }
 
   // 每版锚点统计出现次数：恰好有一版 =1 才动手
@@ -902,28 +974,49 @@ function processMenuWidth(asar, checkOnly, revert) {
 // 关闭「{model} 今日免费计划额度剩余 x%，可升级…」升级广告横幅。等长字节原地覆盖：
 // 渲染层阈值函数按剩余比例产出横幅类型——ratio<=0 走 exhaustedKind（model-exhausted /
 // daily-exhausted），prefix 为 daily 时恒 null，随后 ≤.1→very-low、≤.2→low、≤.5→half-used。
-// 把三个骚扰档阈值改成 -1（比例恒 ≥0，永不命中），广告档全部消失；
+// 把骚扰阈值改成 -1（比例恒 ≥0，永不命中），让广告档全部消失；
 // 额度真正耗尽（0%）、服务端整体耗尽、并发受限、供应商受限、MCP 通知等有用提示全部保留。
-// 哈希文件名随版本变，按内容锚点定位（锚点/已打形态在全 asar 均唯一）。
-const QUOTA_BANNER_PATCHES = [
+// 以内容锚点定位（文件名哈希随版本变，不硬编码）；ZCode 升级后 renderer 实现会变，
+// 所以按版本组织成多个锚点组（v1=旧版三元档位，v2=新版提醒式横幅），
+// 运行时依次探测：唯一命中哪组就用哪组，旧版部署与新版本都能正确判读/还原。
+const QUOTA_VARIANTS = [
   {
-    pattern: Buffer.from("e.ratio<=.1?`model-very-low`", "utf8"),
-    replacement: Buffer.from("e.ratio<=-1?`model-very-low`", "utf8"),
-    desc: "额度骚扰档 very-low(≤10%) 关闭",
+    label: "v1（旧版三元档位）",
+    patches: [
+      {
+        pattern: Buffer.from("e.ratio<=.1?`model-very-low`", "utf8"),
+        replacement: Buffer.from("e.ratio<=-1?`model-very-low`", "utf8"),
+        desc: "额度骚扰档 very-low(≤10%) 关闭",
+      },
+      {
+        pattern: Buffer.from("e.ratio<=.2?`model-low`", "utf8"),
+        replacement: Buffer.from("e.ratio<=-1?`model-low`", "utf8"),
+        desc: "额度骚扰档 low(≤20%) 关闭",
+      },
+      {
+        pattern: Buffer.from("e.ratio<=.5?`model-half-used`", "utf8"),
+        replacement: Buffer.from("e.ratio<=-1?`model-half-used`", "utf8"),
+        desc: "额度骚扰档 half-used(≤50%) 关闭",
+      },
+    ],
   },
   {
-    pattern: Buffer.from("e.ratio<=.2?`model-low`", "utf8"),
-    replacement: Buffer.from("e.ratio<=-1?`model-low`", "utf8"),
-    desc: "额度骚扰档 low(≤20%) 关闭",
-  },
-  {
-    pattern: Buffer.from("e.ratio<=.5?`model-half-used`", "utf8"),
-    replacement: Buffer.from("e.ratio<=-1?`model-half-used`", "utf8"),
-    desc: "额度骚扰档 half-used(≤50%) 关闭",
+    label: "v2（新版提醒式横幅）",
+    patches: [
+      {
+        // 新版决策链：`if(!(r===null||r<=0||r>.1||!i||e.isReminderHidden?.(i,t)))` 才弹提醒，
+        // 把 `r>.-1` 恒真即可让“剩余≤10%”提醒永不出现，耗尽/受限分支不受影响。
+        pattern: Buffer.from("r>.1||!i||e.isReminderHidden", "utf8"),
+        replacement: Buffer.from("r>-1||!i||e.isReminderHidden", "utf8"),
+        desc: "额度骚扰档 very-low(≤10%) 关闭",
+      },
+    ],
   },
 ];
-for (const it of QUOTA_BANNER_PATCHES) {
-  if (it.pattern.length !== it.replacement.length) die(`额度横幅补丁点等长校验失败: ${it.desc}`);
+for (const v of QUOTA_VARIANTS) {
+  for (const it of v.patches) {
+    if (it.pattern.length !== it.replacement.length) die(`额度横幅补丁点等长校验失败: ${v.label}/${it.desc}`);
+  }
 }
 
 function processQuotaBanner(asar, checkOnly, revert) {
@@ -935,25 +1028,36 @@ function processQuotaBanner(asar, checkOnly, revert) {
   const candidates = [];
   for (const { path: p, ent } of walkEntries(state.header)) {
     if (!p.startsWith("out/renderer/assets/") || !p.endsWith(".js") || ent.size < 100000) continue;
-    const bytes = entryBytes(state, ent);
-    const stat = QUOTA_BANNER_PATCHES.map((it) => ({
-      o: countBytes(bytes, it.pattern),
-      n: countBytes(bytes, it.replacement),
-    }));
-    if (stat.some((s) => s.o || s.n)) candidates.push({ path: p, ent, stat });
+    candidates.push({ path: p, ent, bytes: entryBytes(state, ent) });
   }
-  if (candidates.length !== 1) {
-    console.log(`[!] ${asar}\n    额度横幅锚点命中 ${candidates.length} 个文件（期望 1），版本结构可能已变，跳过`);
+
+  // 版本组选择：依次探测 QUOTA_VARIANTS，取第一个有锚点命中的组；组内任一文件唯一，
+  // 且旧组在三元档位下必须三处全部锚定（组内计数校验在下方 kinds 里做）
+  let variant = null;
+  let hits = [];
+  for (const v of QUOTA_VARIANTS) {
+    const vhit = candidates.filter((c) => v.patches.some((it) =>
+      countBytes(c.bytes, it.pattern) > 0 || countBytes(c.bytes, it.replacement) > 0));
+    if (vhit.length === 1) {
+      variant = v;
+      hits = vhit;
+      break;
+    }
+  }
+  if (!variant) {
+    console.log(`[!] ${asar}\n    额度横幅锚点未在任何锚点组唯一命中（期望 1 个文件），版本结构可能已变，跳过`);
     return;
   }
-  const { path: rel, ent, stat } = candidates[0];
+  const { path: rel, bytes } = hits[0];
   const fname = rel.split("/").pop();
-  const absOff = state.dataStart + Number(ent.offset);
-  const kinds = stat.map((s) =>
-    s.o === 1 && s.n === 0 ? "orig" : s.o === 0 && s.n === 1 ? "patched" : "bad");
+  const absOff = state.dataStart + Number(hits[0].ent.offset);
+  const kinds = variant.patches.map((it) =>
+    countBytes(bytes, it.pattern) === 1 && countBytes(bytes, it.replacement) === 0 ? "orig"
+      : countBytes(bytes, it.pattern) === 0 && countBytes(bytes, it.replacement) === 1 ? "patched"
+      : "bad");
   const patchedCnt = kinds.filter((k) => k === "patched").length;
   const badCnt = kinds.filter((k) => k === "bad").length;
-  const total = QUOTA_BANNER_PATCHES.length;
+  const total = variant.patches.length;
 
   if (checkOnly) {
     const st = badCnt ? "锚点计数异常（拒绝操作）"
@@ -962,7 +1066,7 @@ function processQuotaBanner(asar, checkOnly, revert) {
       : `不完整（${patchedCnt}/${total}）`;
     let sideOk = false;
     try { sideOk = fs.existsSync(side) && readJson(side).asar_size === asarSize; } catch { sideOk = false; }
-    console.log(`[*] ${asar}\n    去额度骚扰横幅: ${st} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
+    console.log(`[*] ${asar}\n    去额度骚扰横幅: ${st} | 锚点组: ${variant.label} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
     return;
   }
 
@@ -975,13 +1079,13 @@ function processQuotaBanner(asar, checkOnly, revert) {
       console.log(`    [!] ${fname} | 锚点出现次数异常，拒绝盲改`);
       return;
     }
-    const raw = Buffer.from(entryBytes(state, ent)); // 读后即拷：写入偏移全部基于该快照
+    const raw = Buffer.from(entryBytes(state, hits[0].ent)); // 读后即拷：写入偏移全部基于该快照
     const fd = fs.openSync(asar, "r+");
     let ok = 0;
     try {
       for (let i = 0; i < total; i++) {
         if (kinds[i] !== "patched") continue;
-        const it = QUOTA_BANNER_PATCHES[i];
+        const it = variant.patches[i];
         fs.writeSync(fd, it.pattern, 0, it.pattern.length, absOff + raw.indexOf(it.replacement));
         ok++;
       }
@@ -999,15 +1103,15 @@ function processQuotaBanner(asar, checkOnly, revert) {
     return;
   }
   if (patchedCnt === total) {
-    console.log(`    [=] ${fname} | 已打，跳过`);
+    console.log(`    [=] ${fname} | 已打（${variant.label}），跳过`);
     return;
   }
-  const raw = Buffer.from(entryBytes(state, ent));
+  const raw = Buffer.from(entryBytes(state, hits[0].ent));
   const fd = fs.openSync(asar, "r+");
   try {
     for (let i = 0; i < total; i++) {
       if (kinds[i] !== "orig") continue;
-      const it = QUOTA_BANNER_PATCHES[i];
+      const it = variant.patches[i];
       fs.writeSync(fd, it.replacement, 0, it.replacement.length, absOff + raw.indexOf(it.pattern));
       console.log(`    [+] ${fname} | ${it.desc}`);
     }
@@ -1018,10 +1122,10 @@ function processQuotaBanner(asar, checkOnly, revert) {
   const state2 = asarOpen(asar);
   const ent2 = walkEntries(state2.header).find((x) => x.path === rel)?.ent;
   const back = ent2 ? entryBytes(state2, ent2) : Buffer.alloc(0);
-  const okAll = back.length === ent.size
-    && QUOTA_BANNER_PATCHES.every((it) => countBytes(back, it.replacement) === 1 && countBytes(back, it.pattern) === 0);
+  const okAll = back.length === hits[0].ent.size
+    && variant.patches.every((it) => countBytes(back, it.replacement) === 1 && countBytes(back, it.pattern) === 0);
   if (!okAll) console.log(`    [!] 回读校验未通过，请 --quota-banner --revert 还原后排查`);
-  writeJson(side, { asar_size: asarSize, path: rel, patches: QUOTA_BANNER_PATCHES.map((it) => ({ desc: it.desc })) });
+  writeJson(side, { asar_size: asarSize, path: rel, variant: variant.label, patches: variant.patches.map((it) => ({ desc: it.desc })) });
   console.log(`    状态记录: ${path.basename(side)}${okAll ? "" : "（校验异常）"}`);
 }
 
@@ -1031,21 +1135,35 @@ const TPS_INDEX_PATH = "out/renderer/index.html";
 const TPS_SCRIPT_PATH = "out/renderer/zcode-tps.js";
 const TPS_TAG = `<script src="./${TPS_SCRIPT_PATH.split("/").pop()}"></script>`;
 
-function processTpsFooter(asar, checkOnly, revert, tpsSrc) {
+function processTpsFooter(asar, checkOnly, revert, tpsSrc, mem) {
   const side = asar + ".tps-patch.json";
   const bak = asar + ".tps.bak";
   const asarSize = fs.statSync(asar).size;
 
-  const state = asarOpen(asar);
-  const entMap = new Map(walkEntries(state.header).map((x) => [x.path, x.ent]));
-  const idxEnt = entMap.get(TPS_INDEX_PATH);
-  if (!idxEnt) {
+  const own = !mem;
+  if (own) mem = memAsarOpen(asar);
+  const commit = (suffix, sideFn) => {
+    if (own) {
+      const newSize = mem.flush(suffix);
+      if (sideFn) sideFn(newSize);
+      return newSize;
+    }
+    if (sideFn) mem.deferSide(sideFn);
+    return null;
+  };
+  const idxBytes = mem.get(TPS_INDEX_PATH);
+  if (!idxBytes) {
     console.log(`[!] ${asar}\n    未找到 ${TPS_INDEX_PATH}，版本结构可能已变，跳过`);
-    return;
+    return false;
   }
-  const idxBytes = Buffer.from(entryBytes(state, idxEnt));
   const tagged = idxBytes.includes(Buffer.from(TPS_TAG));
-  const installed = tagged && entMap.has(TPS_SCRIPT_PATH);
+  const scriptCur = mem.has(TPS_SCRIPT_PATH) ? mem.get(TPS_SCRIPT_PATH) : null;
+  if (!tpsSrc) tpsSrc = path.join(__dirname, "zcode-tps.js");
+  const srcExists = fs.existsSync(tpsSrc);
+  const scriptSrc = srcExists ? fs.readFileSync(tpsSrc) : null;
+  // 已打 = tag 在 + 条目在 + 内容与当前注入源逐字节一致（注入源缺失时退回仅检查条目在）。
+  // 源更新导致内容不一致 → 视为未打，重跑即原地升级（与继续按钮补丁同一语义）
+  const installed = tagged && scriptCur != null && (scriptSrc ? scriptCur.equals(scriptSrc) : true);
 
   let saved = null;
   if (fs.existsSync(side)) {
@@ -1056,15 +1174,18 @@ function processTpsFooter(asar, checkOnly, revert, tpsSrc) {
   }
 
   if (checkOnly) {
-    const st = installed ? "已打" : (tagged ? "不完整（index.html 有 tag 但缺脚本条目）" : "未打");
+    const st = installed ? "已打"
+      : tagged && scriptCur ? "不完整（tag/脚本条目与当前源不一致，重跑可原地升级）"
+      : tagged ? "不完整（index.html 有 tag 但缺脚本条目）"
+      : "未打";
     console.log(`[*] ${asar}\n    TPS 统计栏注入: ${st} | sidecar: ${saved ? "有" : "无"} | 备份: ${fs.existsSync(bak) ? "有" : "无"}`);
-    return;
+    return false;
   }
 
   if (revert) {
-    if (!installed && !saved) {
+    if (!tagged && !scriptCur && !saved) {
       console.log(`[.] ${asar}\n    未打 TPS 注入，跳过`);
-      return;
+      return false;
     }
     let originalIdx;
     if (countBytes(idxBytes, Buffer.from(TPS_TAG)) === 1) {
@@ -1075,25 +1196,30 @@ function processTpsFooter(asar, checkOnly, revert, tpsSrc) {
     } else {
       originalIdx = replaceOnce(idxBytes, Buffer.from(TPS_TAG), Buffer.alloc(0));
     }
-    const newSize = repackAsar(asar, { [TPS_INDEX_PATH]: originalIdx }, new Set([TPS_SCRIPT_PATH]));
+    // 脚本条目仅在与注入源/记录逐字节一致时删除，绝不误删用户改动过的内容
+    const expect = scriptSrc || (saved && saved.script_b64 ? Buffer.from(saved.script_b64, "base64") : null);
+    const remove = new Set();
+    if (scriptCur && expect && scriptCur.equals(expect)) remove.add(TPS_SCRIPT_PATH);
+    else if (scriptCur) console.log(`[!] 脚本条目 ${TPS_SCRIPT_PATH} 内容与注入记录不一致，保留不删（可手动处理）`);
+    mem.set(TPS_INDEX_PATH, originalIdx);
+    for (const p of remove) mem.del(p);
     rmQuiet(side);
     rmQuiet(bak);
-    refreshSidecarsAfterRepack(asar);
-    console.log(`[+] ${asar}\n    已还原 index.html 并移除 ${TPS_SCRIPT_PATH}（新大小 ${newSize.toLocaleString()} 字节，备份已清理）`);
-    return;
+    commit(".tps-tmp");
+    console.log(`[+] ${asar}\n    已还原 index.html${remove.has(TPS_SCRIPT_PATH) ? "并移除 " + TPS_SCRIPT_PATH : ""}（备份已清理）`);
+    return true;
   }
 
   if (installed) {
     console.log(`[=] ${asar}\n    已打 TPS 注入，跳过`);
-    return;
+    return false;
   }
+  if (!srcExists) die(`[!] 找不到注入源脚本 ${tpsSrc}（可用 --tps-src 指定路径）`);
   if (countBytes(idxBytes, Buffer.from("</body>")) !== 1) {
     console.log(`[!] ${asar}\n    index.html 的 </body> 出现 ${countBytes(idxBytes, Buffer.from("</body>"))} 次（期望 1），拒绝盲改`);
-    return;
+    return false;
   }
-  if (!tpsSrc) tpsSrc = path.join(__dirname, "zcode-tps.js");
-  if (!fs.existsSync(tpsSrc)) die(`[!] 找不到注入源脚本 ${tpsSrc}（可用 --tps-src 指定路径）`);
-  const scriptBytes = fs.readFileSync(tpsSrc);
+  const scriptBytes = scriptSrc;
 
   if (!fs.existsSync(bak)) {
     fs.copyFileSync(asar, bak);
@@ -1103,17 +1229,19 @@ function processTpsFooter(asar, checkOnly, revert, tpsSrc) {
     console.log("[*] 检测到 app.asar 已被升级覆盖，整包备份 app.asar.tps.bak 已刷新");
   }
 
-  const newIdx = replaceOnce(idxBytes, Buffer.from("</body>"), Buffer.concat([Buffer.from(TPS_TAG), Buffer.from("</body>")]));
-  const newSize = repackAsar(asar, { [TPS_INDEX_PATH]: newIdx, [TPS_SCRIPT_PATH]: scriptBytes }, new Set());
-  writeJson(side, {
+  const newIdx = tagged ? idxBytes : replaceOnce(idxBytes, Buffer.from("</body>"), Buffer.concat([Buffer.from(TPS_TAG), Buffer.from("</body>")]));
+  mem.set(TPS_INDEX_PATH, newIdx);
+  mem.set(TPS_SCRIPT_PATH, scriptBytes);
+  commit(".tps-tmp", (newSize) => writeJson(side, {
     asar_size: newSize,
     index_path: TPS_INDEX_PATH,
     script_entry: TPS_SCRIPT_PATH,
+    script_b64: scriptBytes.toString("base64"),
     index_original_b64: idxBytes.toString("base64"),
-  });
-  refreshSidecarsAfterRepack(asar);
+  }));
   console.log(`[+] ${asar}\n    TPS 统计栏注入完成（${path.basename(tpsSrc)} ${scriptBytes.length.toLocaleString()} 字节 -> ${TPS_SCRIPT_PATH}，index.html 已挂载）\n` +
               `    原件备份: ${path.basename(bak)} | 记录: ${path.basename(side)}`);
+  return true;
 }
 
 // ---------------------------------------------------------------- 继续按钮
@@ -1122,20 +1250,28 @@ const CONT_INDEX_PATH = "out/renderer/index.html";
 const CONT_SCRIPT_PATH = "out/renderer/zcode-continue.js";
 const CONT_TAG = `<script src="./${CONT_SCRIPT_PATH.split("/").pop()}"></script>`;
 
-function processContinueBtn(asar, checkOnly, revert, contSrc) {
+function processContinueBtn(asar, checkOnly, revert, contSrc, mem) {
   const side = asar + ".continue-patch.json";
   const asarSize = fs.statSync(asar).size;
 
-  const state = asarOpen(asar);
-  const entMap = new Map(walkEntries(state.header).map((x) => [x.path, x.ent]));
-  const idxEnt = entMap.get(CONT_INDEX_PATH);
-  if (!idxEnt) {
+  const own = !mem;
+  if (own) mem = memAsarOpen(asar);
+  const commit = (suffix, sideFn) => {
+    if (own) {
+      const newSize = mem.flush(suffix);
+      if (sideFn) sideFn(newSize);
+      return newSize;
+    }
+    if (sideFn) mem.deferSide(sideFn);
+    return null;
+  };
+  const idxBytes = mem.get(CONT_INDEX_PATH);
+  if (!idxBytes) {
     console.log(`[!] ${asar}\n    未找到 ${CONT_INDEX_PATH}，版本结构可能已变，跳过`);
-    return;
+    return false;
   }
-  const idxBytes = Buffer.from(entryBytes(state, idxEnt));
   const tagged = idxBytes.includes(Buffer.from(CONT_TAG));
-  const scriptCur = entMap.has(CONT_SCRIPT_PATH) ? Buffer.from(entryBytes(state, entMap.get(CONT_SCRIPT_PATH))) : null;
+  const scriptCur = mem.has(CONT_SCRIPT_PATH) ? mem.get(CONT_SCRIPT_PATH) : null;
 
   if (!contSrc) contSrc = path.join(__dirname, "zcode-continue.js");
   const srcExists = fs.existsSync(contSrc);
@@ -1157,13 +1293,13 @@ function processContinueBtn(asar, checkOnly, revert, contSrc) {
       : tagged ? "不完整（index.html 有 tag 但缺脚本条目）"
       : "未打";
     console.log(`[*] ${asar}\n    继续按钮注入: ${st} | sidecar: ${saved ? "有" : "无"} | 渲染文件: ${CONT_INDEX_PATH.split("/").pop()}`);
-    return;
+    return false;
   }
 
   if (revert) {
     if (!tagged && !scriptCur && !saved) {
       console.log(`[.] ${asar}\n    未打继续按钮注入，跳过`);
-      return;
+      return false;
     }
     // 精确 strip 自身 tag，保留其它补丁对 index.html 的改动（任意安装/还原顺序安全）
     let newIdx;
@@ -1175,40 +1311,42 @@ function processContinueBtn(asar, checkOnly, revert, contSrc) {
       newIdx = Buffer.from(saved.index_original_b64, "base64");
     } else {
       console.log(`[!] ${asar}\n    index.html 的 ${CONT_TAG} 出现 ${countBytes(idxBytes, Buffer.from(CONT_TAG))} 次（期望 1）且无 sidecar 兜底，拒绝盲改`);
-      return;
+      return false;
     }
     // 脚本条目仅在与注入源/记录逐字节一致时删除，绝不误删用户改动过的内容
     const expect = scriptSrc || (saved && saved.script_b64 ? Buffer.from(saved.script_b64, "base64") : null);
     let remove = new Set();
     if (scriptCur && expect && scriptCur.equals(expect)) remove.add(CONT_SCRIPT_PATH);
     else if (scriptCur) console.log(`[!] 脚本条目 ${CONT_SCRIPT_PATH} 内容与注入记录不一致，保留不删（可手动处理）`);
-    const newSize = repackAsar(asar, { [CONT_INDEX_PATH]: newIdx }, remove, ".cont-tmp");
+    mem.set(CONT_INDEX_PATH, newIdx);
+    for (const p of remove) mem.del(p);
     if (remove.has(CONT_SCRIPT_PATH)) rmQuiet(side);
-    refreshSidecarsAfterRepack(asar);
-    console.log(`[+] ${asar}\n    已还原 index.html${remove.has(CONT_SCRIPT_PATH) ? "并移除 " + CONT_SCRIPT_PATH : ""}（新大小 ${newSize.toLocaleString()} 字节）`);
-    return;
+    commit(".cont-tmp");
+    console.log(`[+] ${asar}\n    已还原 index.html${remove.has(CONT_SCRIPT_PATH) ? "并移除 " + CONT_SCRIPT_PATH : ""}`);
+    return true;
   }
 
   if (installed) {
     console.log(`[=] ${asar}\n    已打继续按钮，跳过`);
-    return;
+    return false;
   }
   if (!srcExists) die(`[!] 找不到注入源脚本 ${contSrc}（可用 --cont-src 指定路径）`);
   if (countBytes(idxBytes, Buffer.from("</body>")) !== 1) {
     console.log(`[!] ${asar}\n    index.html 的 </body> 出现 ${countBytes(idxBytes, Buffer.from("</body>"))} 次（期望 1），拒绝盲改`);
-    return;
+    return false;
   }
   const newIdx = tagged ? idxBytes : replaceOnce(idxBytes, Buffer.from("</body>"), Buffer.concat([Buffer.from(CONT_TAG), Buffer.from("</body>")]));
-  const newSize = repackAsar(asar, { [CONT_INDEX_PATH]: newIdx, [CONT_SCRIPT_PATH]: scriptSrc }, new Set(), ".cont-tmp");
-  writeJson(side, {
+  mem.set(CONT_INDEX_PATH, newIdx);
+  mem.set(CONT_SCRIPT_PATH, scriptSrc);
+  commit(".cont-tmp", (newSize) => writeJson(side, {
     asar_size: newSize,
     index_path: CONT_INDEX_PATH,
     script_entry: CONT_SCRIPT_PATH,
     script_b64: scriptSrc.toString("base64"),
-  });
-  refreshSidecarsAfterRepack(asar);
+  }));
   console.log(`[+] ${asar}\n    继续按钮注入完成（${path.basename(contSrc)} ${scriptSrc.length.toLocaleString()} 字节 -> ${CONT_SCRIPT_PATH}，index.html 已挂载）\n` +
               `    记录: ${path.basename(side)}`);
+  return true;
 }
 
 // ---------------------------------------------------------------- 模型拉取补丁
@@ -1225,32 +1363,99 @@ function loadMhPayload() {
   return readJson(src);
 }
 
-function processModelhub(asar, checkOnly, revert) {
+/** 补丁后渲染 bundle 语法自检（node --check 按 ESM 校验），失败则放弃写入。环境不可用时放行（与旧行为一致）。 */
+function checkBundleSyntax(data, label) {
+  const tmp = path.join(os.tmpdir(), `zcode-patch-syntax-${process.pid}.mjs`);
+  let ok = true;
+  try {
+    fs.writeFileSync(tmp, data);
+    const rc = spawnSync(process.execPath, ["--check", tmp], { timeout: 120000, encoding: "utf8" });
+    if (rc.status !== 0) {
+      console.log(`[!] ${label} 补丁后语法自检失败（node --check），放弃写入：\n        `
+        + (String(rc.stderr || "").split("\n").slice(0, 4).join("\n        ")));
+      ok = false;
+    }
+  } catch (e) {
+    console.log(`[!] ${label} 语法自检环境异常（本次放行）：` + (e && e.message || e));
+  }
+  try { fs.rmSync(tmp, { force: true }); } catch { /* 静默 */ }
+  return ok;
+}
+
+function processModelhub(asar, checkOnly, revert, mem) {
   const side = asar + ".modelhub-patch.json";
   const ph = loadMhPayload();
   const asarSize = fs.statSync(asar).size;
-  const state = asarOpen(asar);
-  const entMap = new Map(walkEntries(state.header).map((x) => [x.path, x.ent]));
+  const own = !mem;
+  if (own) mem = memAsarOpen(asar);
+  const commit = (suffix, sideFn) => {
+    if (own) {
+      const newSize = mem.flush(suffix);
+      if (sideFn) sideFn(newSize);
+      return newSize;
+    }
+    if (sideFn) mem.deferSide(sideFn);
+    return null;
+  };
 
-  // renderer 大文件定位：优先固定哈希名；构建哈希变化时按内容锚点回退（期望唯一命中）
-  let rendRel = entMap.has(ph.RENDER_REL) ? ph.RENDER_REL : null;
-  if (!rendRel) {
-    const anchor = Buffer.from(ph.ORIG_ADD_BTN, "utf8");
-    const hits = [];
-    for (const [p, ent] of entMap) {
-      if (!p.startsWith("out/renderer/assets/") || !p.endsWith(".js")) continue;
-      if (ent.size < 100000) continue;
-      if (entryBytes(state, ent).includes(anchor)) hits.push(p);
-    }
-    if (hits.length === 1) rendRel = hits[0];
-    else {
-      console.log(`[!] ${asar}\n    renderer 内容锚点命中 ${hits.length} 个文件（期望 1），版本结构可能已变，跳过`);
-      return;
-    }
+  // renderer 大文件定位：内容锚点判定 v1/v2（旧版 ADD_BTN/QPT 组合 vs 新版 vRt 调用点）。
+  // 哈希文件名随版本构建变化，一律不硬编码；期望恰有一版命中唯一文件。
+  const v1Bufs = [Buffer.from(ph.ORIG_ADD_BTN, "utf8"), Buffer.from(ph.ORIG_QPT, "utf8")];
+  const v2Buf = Buffer.from(ph.RENDER_V2_ANCHOR, "utf8");
+  // v2.1（模型列表头部）三点注入的字节：签名形参 / 调用点传参 / 头部按钮
+  const v2SigOld = ph.RENDER_V2_SIG_OLD ? Buffer.from(ph.RENDER_V2_SIG_OLD, "utf8") : null;
+  const v2SigNew = ph.RENDER_V2_SIG_NEW ? Buffer.from(ph.RENDER_V2_SIG_NEW, "utf8") : null;
+  const v2PropBuf = ph.RENDER_V2_INSERT ? Buffer.from(ph.RENDER_V2_INSERT, "utf8") : null;
+  const v2HdrAnchor = ph.RENDER_V2_HDR_ANCHOR ? Buffer.from(ph.RENDER_V2_HDR_ANCHOR, "utf8") : null;
+  const v2HdrInsert = ph.RENDER_V2_HDR_INSERT ? Buffer.from(ph.RENDER_V2_HDR_INSERT, "utf8") : null;
+  // 旧版 v2（独立行按钮）整块注入串：仅为已打旧版的原地升级/还原保留
+  const v2LegacyBuf = ph.RENDER_V2_INSERT_LEGACY ? Buffer.from(ph.RENDER_V2_INSERT_LEGACY, "utf8") : null;
+  const v2HdrAfter = ph.RENDER_V2_HDR_AFTER ? Buffer.from(ph.RENDER_V2_HDR_AFTER, "utf8") : null;
+  const v2BtnMark = Buffer.from("拉取模型", "utf8");
+  // v2.1 头部注入判定（位置式）：HDR 锚点与原生添加按钮之间出现注入块即为已打，
+  // 不依赖按钮体逐字节一致——payload 文案/样式微调不会让存量安装的判读与还原失效
+  const mhV21Injected = (buf) => {
+    if (!v2HdrAnchor || !v2HdrAfter) return false;
+    const hdrIdx = buf.indexOf(v2HdrAnchor);
+    if (hdrIdx < 0) return false;
+    const afterHdr = hdrIdx + v2HdrAnchor.length;
+    const addIdx = buf.indexOf(v2HdrAfter, afterHdr);
+    if (addIdx < 0 || addIdx - afterHdr >= 8192) return false;
+    const chunk = buf.subarray(afterHdr, addIdx);
+    return chunk.includes(v2BtnMark) && chunk.includes(MH_MARK_RENDER);
+  };
+  // 位置式剥离头部注入块；不匹配（漂移/异常）时返回 null 走 sidecar 字节兜底
+  const mhV21StripHeader = (buf) => {
+    const hdrIdx = buf.indexOf(v2HdrAnchor);
+    if (hdrIdx < 0) return null;
+    const afterHdr = hdrIdx + v2HdrAnchor.length;
+    const addIdx = buf.indexOf(v2HdrAfter, afterHdr);
+    if (addIdx < 0 || addIdx - afterHdr >= 8192) return null;
+    const chunk = buf.subarray(afterHdr, addIdx);
+    if (!chunk.includes(v2BtnMark) || !chunk.includes(MH_MARK_RENDER)) return null;
+    return Buffer.concat([buf.subarray(0, afterHdr), buf.subarray(addIdx)]);
+  };
+  const found = [];
+  mem.each((p, ent) => {
+    if (!p.startsWith("out/renderer/assets/") || !p.endsWith(".js") || ent.size < 100000) return;
+    const b = mem.get(p);
+    const isV1 = v1Bufs.some((x) => b.includes(x));
+    const isV2 = b.includes(v2Buf);
+    if (isV1 || isV2) found.push({ path: p, isV1, isV2 });
+  });
+  const v1hits = found.filter((f) => f.isV1);
+  const v2hits = found.filter((f) => f.isV2);
+  let mode = null;
+  let rendRel = null;
+  if (v1hits.length === 1 && v2hits.length === 0) { mode = "v1"; rendRel = v1hits[0].path; }
+  else if (v2hits.length === 1 && v1hits.length === 0) { mode = "v2"; rendRel = v2hits[0].path; }
+  else {
+    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} v2=${v2hits.length} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
+    return false;
   }
-  if (!entMap.has(MH_PRELOAD_REL) || !entMap.has(MH_MAIN_REL)) {
+  if (!mem.has(MH_PRELOAD_REL) || !mem.has(MH_MAIN_REL)) {
     console.log(`[!] ${asar}\n    缺少 preload/main 条目，版本结构可能已变，跳过`);
-    return;
+    return false;
   }
 
   const marks = [
@@ -1258,7 +1463,7 @@ function processModelhub(asar, checkOnly, revert) {
     [MH_MAIN_REL, MH_MARK_MAIN],
     [rendRel, MH_MARK_RENDER],
   ];
-  const tagged = marks.filter(([rel, mark]) => entryBytes(state, entMap.get(rel)).includes(mark)).length;
+  const tagged = marks.filter(([rel, mark]) => mem.get(rel).includes(mark)).length;
 
   let saved = null;
   if (fs.existsSync(side)) {
@@ -1269,22 +1474,26 @@ function processModelhub(asar, checkOnly, revert) {
   }
 
   if (checkOnly) {
-    const st = tagged === 3 ? "已打" : (tagged ? `不完整（${tagged}/3）` : "未打");
-    console.log(`[*] ${asar}\n    模型拉取补丁: ${st} | sidecar: ${saved ? "有" : "无"} | 渲染文件: ${rendRel.split("/").pop()}`);
-    return;
+    const rendBytes = mem.get(rendRel);
+    const isNewForm = v2SigNew && countBytes(rendBytes, v2SigNew) === 1 && mhV21Injected(rendBytes);
+    const isLegacyForm = v2LegacyBuf && countBytes(rendBytes, v2LegacyBuf) === 1;
+    const st = tagged === 3 ? (isNewForm ? "已打" : isLegacyForm ? "已打（旧版独立行位置，重跑 --modelhub 原地升级）" : "已打")
+      : (tagged ? `不完整（${tagged}/3）` : "未打");
+    console.log(`[*] ${asar}\n    模型拉取补丁: ${st} | sidecar: ${saved ? "有" : "无"} | 渲染文件: ${rendRel.split("/").pop()}（锚点组 ${mode}）`);
+    return false;
   }
 
   if (revert) {
-    const anyTagged = marks.some(([rel, mark]) => entryBytes(state, entMap.get(rel)).includes(mark));
+    const anyTagged = marks.some(([rel, mark]) => mem.get(rel).includes(mark));
     if (!anyTagged && !saved) {
       console.log(`[.] ${asar}\n    未打模型拉取补丁，跳过`);
-      return;
+      return false;
     }
     const stickyRec = saved && (saved.files || []).find((f) => f.path === rendRel && f.sticky_after);
     const overwrite = {};
     let exact = 0, fallback = 0;
     for (const [rel, mark] of marks) {
-      const cur = Buffer.from(entryBytes(state, entMap.get(rel)));
+      const cur = mem.get(rel);
       if (!cur.includes(mark)) {
         overwrite[rel] = cur;   // 已是原版
         continue;
@@ -1297,7 +1506,47 @@ function processModelhub(asar, checkOnly, revert) {
         const h = Buffer.from(ph.MAIN_HANDLERS, "utf8");
         if (countBytes(cur, h) === 1) r = replaceOnce(cur, h, Buffer.alloc(0));
       } else {
-        r = revertMhRenderer(cur, ph, stickyRec ? stickyRec.sticky_after : null);
+        // renderer：优先剥离 v2.1 三点注入（签名/传参/头部按钮），其次旧版 v2 注入块，最后走 v1 逐点反替换
+        if (v2SigNew && countBytes(cur, v2SigNew) === 1) {
+          let r2 = replaceOnce(cur, v2SigNew, v2SigOld);
+          const propApplied = Buffer.concat([v2Buf, v2PropBuf]);
+          if (countBytes(r2, propApplied) !== 1) {
+            r = null;   // 传参串漂移：走 sidecar 字节兜底
+          } else {
+            r2 = replaceOnce(r2, propApplied, v2Buf);
+            r2 = mhV21StripHeader(r2);
+            if (r2 === null) {
+              r = null;   // 头部注入块漂移：走 sidecar 字节兜底
+            } else {
+              const hb = Buffer.from(ph.HELPER_BLOCK, "utf8");
+              if (r2.includes(hb)) {
+                if (countBytes(r2, hb) !== 1) {
+                  console.log(`[!] ${asar}\n    ${rel} 的 HELPER 块出现多次（期望 1），拒绝盲改`);
+                  return false;
+                }
+                r2 = replaceOnce(r2, hb, Buffer.alloc(0));
+              }
+              r = r2;
+            }
+          }
+        } else if (v2LegacyBuf && cur.includes(v2LegacyBuf)) {
+          if (countBytes(cur, v2LegacyBuf) !== 1) {
+            console.log(`[!] ${asar}\n    ${rel} 的旧版 v2 注入块出现 ${countBytes(cur, v2LegacyBuf)} 次（期望 1），拒绝盲改`);
+            return false;
+          }
+          let r2 = replaceOnce(cur, v2LegacyBuf, Buffer.alloc(0));
+          const hb = Buffer.from(ph.HELPER_BLOCK, "utf8");
+          if (r2.includes(hb)) {
+            if (countBytes(r2, hb) !== 1) {
+              console.log(`[!] ${asar}\n    ${rel} 的 HELPER 块出现多次（期望 1），拒绝盲改`);
+              return false;
+            }
+            r2 = replaceOnce(r2, hb, Buffer.alloc(0));
+          }
+          r = r2;
+        } else {
+          r = revertMhRenderer(cur, ph, stickyRec ? stickyRec.sticky_after : null);
+        }
       }
       if (r === null) {
         const f = saved && (saved.files || []).find((x) => x.path === rel);
@@ -1307,51 +1556,106 @@ function processModelhub(asar, checkOnly, revert) {
       } else exact++;
       overwrite[rel] = r;
     }
-    repackAsar(asar, overwrite, new Set(), ".modelhub-tmp");
+    for (const [rel, buf] of Object.entries(overwrite)) mem.set(rel, buf);
     rmQuiet(side);
-    refreshSidecarsAfterRepack(asar);
+    commit(".modelhub-tmp");
     console.log(`[+] ${asar}\n    已还原 3 个条目（精确反向替换 ${exact}，字节兜底 ${fallback}，记录已清理）`);
-    return;
+    return true;
   }
 
+  let upgradeLegacy = false;
   if (tagged === 3) {
-    console.log(`[=] ${asar}\n    已打模型拉取补丁，跳过`);
-    return;
+    const rendNow = mem.get(rendRel);
+    const isNewForm = v2SigNew && countBytes(rendNow, v2SigNew) === 1 && mhV21Injected(rendNow);
+    const isLegacyForm = v2LegacyBuf && countBytes(rendNow, v2LegacyBuf) === 1;
+    if (isNewForm) {
+      console.log(`[=] ${asar}\n    已打模型拉取补丁（v2.1 列表头部位置），跳过`);
+      return false;
+    }
+    if (!isLegacyForm) {
+      console.log(`[!] ${asar}\n    注入形态无法识别（标记在但新/旧注入块均未命中），先 --modelhub --revert 再重打`);
+      return false;
+    }
+    // 升级必须从 sidecar 原件整体回退三个条目后重打：当前 preload/main 已含旧注入，
+    // 直接套用注入串会二次注入（main 里 ipcMain.handle 同通道注册两次会抛异常，应用无法启动）
+    if (!saved || !(saved.files || []).some((f) => f.path === rendRel)) {
+      console.log(`[!] ${asar}\n    旧版注入的 sidecar 原件缺失或失配，无法安全原地升级；先 --modelhub --revert 再重打`);
+      return false;
+    }
+    console.log(`[*] 检测到旧版 v2 注入（独立行按钮），从 sidecar 原件回退后原地升级为 v2.1 列表头部位置`);
+    upgradeLegacy = true;
   }
-  if (tagged) {
+  if (tagged && !upgradeLegacy) {
     console.log(`[!] ${asar}\n    注入状态不完整（${tagged}/3），先 --modelhub --revert 再重打`);
-    return;
+    return false;
   }
 
-  // —— 组装补丁字节（替换序列与上游 patch-core.js 一致，先校验锚点各唯一一次） ——
-  const preBuf = Buffer.from(entryBytes(state, entMap.get(MH_PRELOAD_REL)));
-  const mainBuf = Buffer.from(entryBytes(state, entMap.get(MH_MAIN_REL)));
-  const rendBuf = Buffer.from(entryBytes(state, entMap.get(rendRel)));
+  // —— 组装补丁字节（先校验锚点各唯一一次） ——
+  let preBuf = mem.get(MH_PRELOAD_REL);
+  let mainBuf = mem.get(MH_MAIN_REL);
+  let rendBuf = mem.get(rendRel);
+  if (upgradeLegacy) {
+    const orig = new Map((saved.files || []).map((f) => [f.path, Buffer.from(f.original_b64, "base64")]));
+    const missing = [MH_PRELOAD_REL, MH_MAIN_REL, rendRel].filter((p) => !orig.has(p));
+    if (missing.length) {
+      console.log(`[!] ${asar}\n    sidecar 原件缺条目：${missing.join(", ")}，拒绝升级`);
+      return false;
+    }
+    // sidecar 原件拍摄于 modelhub 首打时——若其后又打过别的 preload/main 类补丁（如 --enhance-btn），
+    // 回退会连它们一起抹掉。检测到这种情况就提示重跑，避免静默丢失功能入口。
+    const hadEnhance = mainBuf.includes(ENH_MARK_MAIN) || preBuf.includes(ENH_MARK_PRELOAD);
+    preBuf = orig.get(MH_PRELOAD_REL);
+    mainBuf = orig.get(MH_MAIN_REL);
+    rendBuf = orig.get(rendRel);
+    if (hadEnhance) {
+      console.log("[*] 检测到此前打过增强按钮补丁，modelhub 回退会抹掉其 preload/main 注入——升级完成后请重跑 --enhance-btn 修复");
+    }
+  }
 
   const preAnchor = Buffer.from(ph.PRELOAD_ANCHOR, "utf8");
   const preCnt = countBytes(preBuf, preAnchor);
   if (preCnt !== 1) {
     console.log(`[!] ${asar}\n    preload 锚点出现 ${preCnt} 次（期望 1），拒绝盲改`);
-    return;
+    return false;
   }
-  for (const key of ["ORIG_ADD_BTN", "ORIG_QPT", "STICKY_OLD", "LE_OLD"]) {
-    const cnt = countBytes(rendBuf, Buffer.from(ph[key], "utf8"));
-    if (cnt !== 1) {
-      console.log(`[!] ${asar}\n    renderer 锚点 ${key} 出现 ${cnt} 次（期望 1），拒绝盲改`);
-      return;
+  if (mode === "v1") {
+    for (const key of ["ORIG_ADD_BTN", "ORIG_QPT", "STICKY_OLD", "LE_OLD"]) {
+      const cnt = countBytes(rendBuf, Buffer.from(ph[key], "utf8"));
+      if (cnt !== 1) {
+        console.log(`[!] ${asar}\n    renderer 锚点 ${key} 出现 ${cnt} 次（期望 1），拒绝盲改`);
+        return false;
+      }
+    }
+  } else {
+    const aCnt = countBytes(rendBuf, v2Buf);
+    const residue = [
+      ["v2.1签名", v2SigNew], ["v2.1传参", v2PropBuf], ["v2.1按钮", v2HdrInsert],
+    ].map(([lbl, b]) => b ? countBytes(rendBuf, b) : 0).reduce((a, b) => a + b, 0);
+    if (aCnt !== 1 || residue !== 0
+      || countBytes(rendBuf, v2SigOld) !== 1 || countBytes(rendBuf, v2HdrAnchor) !== 1) {
+      console.log(`[!] ${asar}\n    renderer 锚点组 v2 计数异常（call=${aCnt} 残留=${residue} sigOld=${countBytes(rendBuf, v2SigOld)} hdr=${countBytes(rendBuf, v2HdrAnchor)}，期望 1/0/1/1），拒绝盲改`);
+      return false;
     }
   }
 
-  const pNew = replaceOnce(
-    preBuf, preAnchor,
-    Buffer.from('exposeInMainWorld("zcode",{' + ph.PRELOAD_INJECT + "connectRemote", "utf8"));
+  const pNew = replaceOnce(preBuf, preAnchor,
+    Buffer.from(ph.PRELOAD_ANCHOR + ph.PRELOAD_INJECT, "utf8"));
   const mNew = Buffer.concat([mainBuf, Buffer.from(ph.MAIN_HANDLERS, "utf8")]);
-  let rNew = replaceOnce(rendBuf, Buffer.from(ph.ORIG_ADD_BTN, "utf8"),
-    Buffer.from(ph.ADD_BTN + "," + ph.ORIG_ADD_BTN, "utf8"));
-  rNew = replaceOnce(rNew, Buffer.from(ph.ORIG_QPT, "utf8"), Buffer.from(ph.EDIT_WRAP, "utf8"));
-  rNew = replaceOnce(rNew, Buffer.from(ph.STICKY_OLD, "utf8"), Buffer.from(ph.STICKY_NEW, "utf8"));
-  rNew = replaceOnce(rNew, Buffer.from(ph.LE_OLD, "utf8"), Buffer.from(ph.LE_NEW, "utf8"));
+  let rNew;
+  if (mode === "v1") {
+    rNew = replaceOnce(rendBuf, Buffer.from(ph.ORIG_ADD_BTN, "utf8"),
+      Buffer.from(ph.ADD_BTN + "," + ph.ORIG_ADD_BTN, "utf8"));
+    rNew = replaceOnce(rNew, Buffer.from(ph.ORIG_QPT, "utf8"), Buffer.from(ph.EDIT_WRAP, "utf8"));
+    rNew = replaceOnce(rNew, Buffer.from(ph.STICKY_OLD, "utf8"), Buffer.from(ph.STICKY_NEW, "utf8"));
+    rNew = replaceOnce(rNew, Buffer.from(ph.LE_OLD, "utf8"), Buffer.from(ph.LE_NEW, "utf8"));
+  } else {
+    // v2.1 三点注入：① vRt 签名加 mhEndpoint 形参 ② 调用点 props 内传端点草稿数据（插在锚点之后才是 props 位置）③ 模型列表头部插入拉取按钮
+    rNew = replaceOnce(rendBuf, v2SigOld, v2SigNew);
+    rNew = replaceOnce(rNew, v2Buf, Buffer.concat([v2Buf, v2PropBuf]));
+    rNew = replaceOnce(rNew, v2HdrAnchor, Buffer.concat([v2HdrAnchor, v2HdrInsert]));
+  }
   rNew = Buffer.concat([rNew, Buffer.from(ph.HELPER_BLOCK, "utf8")]);
+  if (!checkBundleSyntax(rNew, path.basename(rendRel))) return;
 
   const overwrite = {
     [MH_PRELOAD_REL]: pNew,
@@ -1363,23 +1667,30 @@ function processModelhub(asar, checkOnly, revert) {
     [MH_MAIN_REL, mainBuf],
     [rendRel, rendBuf],
   ];
-  // sticky_after 必须取「注入点」后文：STICKY_NEW 在文件里有大量自然出现，indexOf 会拿错；
-  // 注入点 = STICKY_OLD 在原字节中的位置，替换后 NEW 就在同一 offset
-  const soBuf = Buffer.from(ph.STICKY_OLD, "utf8");
-  const soIdx = rendBuf.indexOf(soBuf);
-  const stickyAfter = soIdx >= 0 ? rNew.subarray(soIdx + ph.STICKY_NEW.length, soIdx + ph.STICKY_NEW.length + 32).toString("base64") : null;
-  const newSize = repackAsar(asar, overwrite, new Set(), ".modelhub-tmp");
-  writeJson(side, {
+  // sticky_after 仅 v1 需要（STICKY_NEW 在文件里有大量自然出现，需用注入点后文唯一定位）
+  let stickyAfter = null;
+  if (mode === "v1") {
+    const soBuf = Buffer.from(ph.STICKY_OLD, "utf8");
+    const soIdx = rendBuf.indexOf(soBuf);
+    stickyAfter = soIdx >= 0
+      ? rNew.subarray(soIdx + ph.STICKY_NEW.length, soIdx + ph.STICKY_NEW.length + 32).toString("base64")
+      : null;
+  }
+  mem.set(MH_PRELOAD_REL, pNew);
+  mem.set(MH_MAIN_REL, mNew);
+  mem.set(rendRel, rNew);
+  commit(".modelhub-tmp", (newSize) => writeJson(side, {
     asar_size: newSize,
     renderer_path: rendRel,
+    mode: mode === "v2" ? "v2.1" : mode,
     files: originals.map(([rel, b]) => ({
       path: rel, size: b.length, original_b64: b.toString("base64"),
       ...(rel === rendRel && stickyAfter ? { sticky_after: stickyAfter } : {}),
     })),
-  });
-  refreshSidecarsAfterRepack(asar);
-  console.log(`[+] ${asar}\n    模型拉取补丁注入完成（preload/main/renderer 三条目改写）\n` +
-              `    记录: ${path.basename(side)} | 新大小 ${newSize.toLocaleString()} 字节`);
+  }));
+  console.log(`[+] ${asar}\n    模型拉取补丁注入完成（preload/main/renderer 三条目改写；拉取按钮位于模型列表头部「添加模型」左侧）\n` +
+              `    记录: ${path.basename(side)}`);
+  return true;
 }
 
 // ------------------------------------------------- 增强提示词按钮（--enhance-btn，asar 重打包级）
@@ -1411,23 +1722,31 @@ function loadEnhanceSrc(explicit) {
   return fs.readFileSync(p);
 }
 
-function processEnhanceBtn(asar, checkOnly, revert, srcPath) {
+function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   const ph = loadMhPayload();
-  const state = asarOpen(asar);
-  const entMap = new Map(walkEntries(state.header).map((x) => [x.path, x.ent]));
+  const own = !mem;
+  if (own) mem = memAsarOpen(asar);
+  const commit = (suffix) => {
+    if (own) {
+      const newSize = mem.flush(suffix);
+      console.log(`    新大小 ${newSize.toLocaleString()} 字节`);
+      return newSize;
+    }
+    return null;
+  };
   const need = ["out/preload/index.cjs", "out/main/index.js", ENH_INDEX_PATH];
-  if (need.some((p) => !entMap.has(p))) {
+  if (need.some((p) => !mem.has(p))) {
     console.log(`[!] ${asar}\n    缺少 preload/main/index 条目，版本结构可能已变，跳过`);
-    return;
+    return false;
   }
-  const preBuf = Buffer.from(entryBytes(state, entMap.get("out/preload/index.cjs")));
-  const mainBuf = Buffer.from(entryBytes(state, entMap.get("out/main/index.js")));
-  const idxBuf = Buffer.from(entryBytes(state, entMap.get(ENH_INDEX_PATH)));
-  const scriptEnt = entMap.get(ENH_SCRIPT_PATH);
+  const preBuf = mem.get("out/preload/index.cjs");
+  const mainBuf = mem.get("out/main/index.js");
+  const idxBuf = mem.get(ENH_INDEX_PATH);
+  const scriptCur0 = mem.has(ENH_SCRIPT_PATH) ? mem.get(ENH_SCRIPT_PATH) : null;
 
   const flags = [
     idxBuf.includes(ENH_MARK_INDEX),
-    !!scriptEnt,
+    !!scriptCur0,
     preBuf.includes(ENH_MARK_PRELOAD),
     mainBuf.includes(ENH_MARK_MAIN),
   ];
@@ -1445,14 +1764,14 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath) {
   const enhSrcPath = srcPath || path.join(__dirname, "zcode-enhance.js");
   const scriptSrc = fs.existsSync(enhSrcPath) ? fs.readFileSync(enhSrcPath) : null;
   const mainIsCurrent = countBytes(mainBuf, handlers) === 1;
-  const scriptIsCurrent = !!scriptEnt && !!scriptSrc && scriptSrc.equals(Buffer.from(entryBytes(state, scriptEnt)));
+  const scriptIsCurrent = !!scriptCur0 && !!scriptSrc && scriptSrc.equals(scriptCur0);
 
   if (checkOnly) {
     const st = tagged ? (isV2 ? (mainIsCurrent && scriptIsCurrent ? "已打" : "已打（载荷/脚本有更新，重跑 --enhance-btn 原地升级）")
                               : "已打（旧版，重跑 --enhance-btn 原地升级）")
                       : (partial ? `不完整（${partial}/4）` : "未打");
     console.log(`[*] ${asar}\n    增强提示词按钮: ${st}`);
-    return;
+    return false;
   }
 
   /** 移除 main 里的 enhance 块：边界式优先（与载荷版本无关），精确整串兜底。 */
@@ -1502,30 +1821,31 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath) {
     }
     if (bad.length || pre2.includes(ENH_MARK_PRELOAD) || main2.includes(ENH_MARK_MAIN)) {
       console.log(`[!] ${asar}\n    ${bad.join("；") || "注入残留无法识别"}，拒绝盲改`);
-      return;
+      return false;
     }
-    repackAsar(asar,
-      { "out/preload/index.cjs": pre2, "out/main/index.js": main2, [ENH_INDEX_PATH]: idx2 },
-      new Set([ENH_SCRIPT_PATH]), ".enhance-tmp");
-    refreshSidecarsAfterRepack(asar);
+    mem.set("out/preload/index.cjs", pre2);
+    mem.set("out/main/index.js", main2);
+    mem.set(ENH_INDEX_PATH, idx2);
+    mem.del(ENH_SCRIPT_PATH);
+    commit(".enhance-tmp");
     console.log(`[+] ${asar}\n    已精确移除增强按钮注入（preload/main/index 复原，脚本条目已删）`);
-    return;
+    return true;
   }
 
   // 打补丁 / 原地升级（旧版注入先剥离再按当前载荷重注入，partial 状态一并修复）
-  if (tagged && isV2 && mainIsCurrent && scriptIsCurrent) { console.log(`[=] ${asar}\n    已打增强按钮（载荷为最新），跳过`); return; }
+  if (tagged && isV2 && mainIsCurrent && scriptIsCurrent) { console.log(`[=] ${asar}\n    已打增强按钮（载荷为最新），跳过`); return false; }
   const bad = [];
   let pre2 = stripPreload(preBuf, bad);
   let main2 = mainBuf.includes(ENH_MARK_MAIN) ? stripMainBlock(mainBuf, bad) : mainBuf;
   if (bad.length || pre2.includes(ENH_MARK_PRELOAD) || main2.includes(ENH_MARK_MAIN)) {
     console.log(`[!] ${asar}\n    ${bad.join("；") || "注入残留无法识别"}，先 --enhance-btn --revert 再重打`);
-    return;
+    return false;
   }
 
   const cntA = countBytes(pre2, anchorA), cntB = countBytes(pre2, anchorB);
   if (cntA + cntB !== 1) {
     console.log(`[!] ${asar}\n    preload 锚点命中 ${cntA + cntB} 个（期望 1），拒绝盲改`);
-    return;
+    return false;
   }
   const anchor = cntA === 1 ? anchorA : anchorB;
   const tail = cntA === 1 ? "connectRemote" : "modelhubFetchModels";
@@ -1539,20 +1859,18 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath) {
   if (!idxNew.includes(ENH_MARK_INDEX)) {
     if (countBytes(idxNew, Buffer.from("</body>")) !== 1) {
       console.log(`[!] ${asar}\n    index.html 的 </body> 出现 ${countBytes(idxNew, Buffer.from("</body>"))} 次（期望 1），拒绝盲改`);
-      return;
+      return false;
     }
     idxNew = replaceOnce(idxNew, Buffer.from("</body>"), Buffer.concat([ENH_MARK_INDEX, Buffer.from("</body>")]));
   }
 
-  const newSize = repackAsar(asar, {
-    "out/preload/index.cjs": preNew,
-    "out/main/index.js": mainNew,
-    [ENH_INDEX_PATH]: idxNew,
-    [ENH_SCRIPT_PATH]: scriptBytes,
-  }, new Set(), ".enhance-tmp");
-  refreshSidecarsAfterRepack(asar);
-  console.log(`[+] ${asar}\n    增强提示词按钮注入完成${tagged ? "（旧版已原地升级）" : ""}（preload IPC×2 + main handler×2 + 工具栏按钮脚本）\n` +
-              `    新大小 ${newSize.toLocaleString()} 字节`);
+  mem.set("out/preload/index.cjs", preNew);
+  mem.set("out/main/index.js", mainNew);
+  mem.set(ENH_INDEX_PATH, idxNew);
+  mem.set(ENH_SCRIPT_PATH, scriptBytes);
+  commit(".enhance-tmp");
+  console.log(`[+] ${asar}\n    增强提示词按钮注入完成${tagged ? "（旧版已原地升级）" : ""}（preload IPC×2 + main handler×2 + 工具栏按钮脚本）`);
+  return true;
 }
 
 /** modelhub renderer 条目的精确反向替换；STICKY 用 sidecar 记录的后文上下文唯一定位。
@@ -1610,10 +1928,11 @@ function revertMhRenderer(cur, ph, stickyAfterB64) {
 function processEditAll(target, checkOnly, revert) {
   const side = target + ".editall.json";
   const ph = loadMhPayload();
-  const pairs = [
-    ["P1", ph.P1_OLD, ph.P1_NEW],
-    ["P2", ph.P2_OLD, ph.P2_NEW],
-  ].map(([lbl, o, n]) => [lbl, Buffer.from(o, "utf8"), Buffer.from(n, "utf8")]);
+  // 每项为变体列表：旧内核 y/m 形态与新内核 v/f 形态，打时按内容命中选一。
+  const variants = [
+    ["P1", [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2]]],
+    ["P2", [[ph.P2_OLD, ph.P2_NEW]]],
+  ].map(([lbl, list]) => [lbl, list.map(([o, n]) => [Buffer.from(o, "utf8"), Buffer.from(n, "utf8")])]);
 
   let data;
   try {
@@ -1623,9 +1942,8 @@ function processEditAll(target, checkOnly, revert) {
     return;
   }
 
-  const newCnt = Object.fromEntries(pairs.map(([lbl, , n]) => [lbl, countBytes(data, n)]));
-  const oldCnt = Object.fromEntries(pairs.map(([lbl, o]) => [lbl, countBytes(data, o)]));
-  const applied = pairs.filter(([lbl]) => newCnt[lbl] >= 1 && oldCnt[lbl] === 0).length;
+  const cnt = (v) => [countBytes(data, v[0]), countBytes(data, v[1])];
+  const applied = variants.filter(([, list]) => list.some((v) => cnt(v)[1] >= 1 && cnt(v)[0] === 0)).length;
   const st = applied === 2 ? "已打" : (applied === 1 ? "部分（异常）" : "未打");
   console.log(`[*] ${target}`);
   console.log(`    全消息可编辑: ${st}`);
@@ -1635,9 +1953,9 @@ function processEditAll(target, checkOnly, revert) {
   if (revert) {
     if (applied === 0) { console.log("    [.] 未打，跳过"); return; }
     let changed = data;
-    for (const [lbl, o, n] of pairs) {
-      if (newCnt[lbl] === 1) changed = replaceOnce(changed, n, o);
-    }
+    for (const [, list] of variants)
+      for (const v of list)
+        if (cnt(v)[1] === 1) changed = replaceOnce(changed, v[1], v[0]);
     try {
       fs.writeFileSync(target, changed);
       rmQuiet(side);
@@ -1653,14 +1971,18 @@ function processEditAll(target, checkOnly, revert) {
     console.log("    [!] 状态异常（部分替换），先 --edit-all --revert 再重打");
     return;
   }
-  for (const [lbl, o] of pairs) {
-    if (oldCnt[lbl] !== 1) {
-      console.log(`    [!] 锚点 ${lbl} 出现 ${oldCnt[lbl]} 次（期望 1），版本可能不兼容，拒绝盲改`);
+  for (const [lbl, list] of variants) {
+    const hit = list.filter((v) => cnt(v)[0] === 1 && cnt(v)[1] === 0);
+    if (hit.length !== 1) {
+      const detail = list.map((v) => `旧=${cnt(v)[0]} 新=${cnt(v)[1]}`).join("，");
+      console.log(`    [!] 锚点 ${lbl} 变体命中 ${hit.length} 个（${detail}），版本可能不兼容，拒绝盲改`);
       return;
     }
   }
   let changed = data;
-  for (const [lbl, o, n] of pairs) changed = replaceOnce(changed, o, n);
+  for (const [, list] of variants)
+    for (const v of list)
+      if (cnt(v)[0] === 1) changed = replaceOnce(changed, v[0], v[1]);
 
   // 语法自检：写临时文件跑 node --check，失败零改动（.cjs 后缀让 node 可识别）
   const tmp = target + ".editall-tmp.cjs";
@@ -1750,83 +2072,50 @@ function main() {
 
   const asarFlags = opts.usageChart || opts.menuWidth || opts.continueBtn || opts.tpsFooter || opts.modelhub || opts.enhanceBtn || opts.quotaBanner;
 
+  // asar 补丁注册表：新增 asar 类补丁 = 加一行 + processX 支持 mem 参数（批量合并落盘）。
+  // repack: true 的补丁走 MemAsar 共享内存态，多个同时请求时合并为一次全量重打包；
+  // 顺序即历史 wrapper 顺序（continue→tps→modelhub→enhance），保证锚点所见状态与
+  // 逐个顺序执行字节一致。in-place（等长原位改）补丁先行，避免 repack 读到旧文件。
+  const ASAR_PATCH_TABLE = [
+    { opt: "usageChart",  label: "用量页去截断补丁", run: (a, c, r) => processUsageChart(a, c, r) },
+    { opt: "menuWidth",   label: "模型菜单加宽",     run: (a, c, r) => processMenuWidth(a, c, r) },
+    { opt: "quotaBanner", label: "去额度骚扰横幅",   run: (a, c, r) => processQuotaBanner(a, c, r) },
+    { opt: "continueBtn", label: "继续按钮注入",     repack: true, run: (a, c, r, m) => processContinueBtn(a, c, r, opts.contSrc, m) },
+    { opt: "tpsFooter",   label: "TPS 统计栏注入",   repack: true, run: (a, c, r, m) => processTpsFooter(a, c, r, opts.tpsSrc, m) },
+    { opt: "modelhub",    label: "模型拉取补丁（modelhub）", repack: true, run: (a, c, r, m) => processModelhub(a, c, r, m) },
+    { opt: "enhanceBtn",  label: "增强提示词按钮",   repack: true, run: (a, c, r, m) => processEnhanceBtn(a, c, r, opts.enhanceSrc, m) },
+  ];
+  const guardFileBusy = (e, a) => {
+    if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
+      console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
+    } else throw e;
+  };
+
   if (asarFlags) {
     const asars = resolveAsars(opts.target);
-    if (opts.usageChart) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== 用量页去截断补丁，目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) processUsageChart(a, opts.check, opts.revert);
-    }
-    if (opts.menuWidth) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== 模型菜单加宽，目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) {
-        try { processMenuWidth(a, opts.check, opts.revert); }
-        catch (e) {
-          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-            console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
-          } else throw e;
-        }
+    const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
+    const active = ASAR_PATCH_TABLE.filter((t) => opts[t.opt]);
+    const inPlace = active.filter((t) => !t.repack);
+    const repackable = active.filter((t) => t.repack);
+    for (const t of active) console.log(`=== ${t.label}，目标 ${asars.length} 处，模式：${mode} ===`);
+    for (const a of asars) {
+      for (const t of inPlace) {
+        try { t.run(a, opts.check, opts.revert); }
+        catch (e) { guardFileBusy(e, a); }
       }
-    }
-    if (opts.quotaBanner) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== 去额度骚扰横幅，目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) {
-        try { processQuotaBanner(a, opts.check, opts.revert); }
-        catch (e) {
-          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-            console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
-          } else throw e;
-        }
-      }
-    }
-    if (opts.continueBtn) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== 继续按钮注入，目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) {
-        try { processContinueBtn(a, opts.check, opts.revert, opts.contSrc); }
-        catch (e) {
-          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-            console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
-          } else throw e;
-        }
-      }
-    }
-    if (opts.tpsFooter) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== TPS 统计栏注入，目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) {
-        try { processTpsFooter(a, opts.check, opts.revert, opts.tpsSrc); }
-        catch (e) {
-          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-            console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
-          } else throw e;
-        }
-      }
-    }
-    if (opts.modelhub) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== 模型拉取补丁（modelhub），目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) {
-        try { processModelhub(a, opts.check, opts.revert); }
-        catch (e) {
-          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-            console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
-          } else throw e;
-        }
-      }
-    }
-    if (opts.enhanceBtn) {
-      const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-      console.log(`=== 增强提示词按钮，目标 ${asars.length} 处，模式：${mode} ===`);
-      for (const a of asars) {
-        try { processEnhanceBtn(a, opts.check, opts.revert, opts.enhanceSrc); }
-        catch (e) {
-          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-            console.log(`[!] ${a}\n    文件被占用（ZCode 正在运行）或无写入权限；完全退出 ZCode 后重试`);
-          } else throw e;
-        }
+      if (repackable.length) {
+        try {
+          // MemAsar 批量：一次打开、N 个补丁内存叠加、单次落盘（revert/apply 同一套路）
+          const mem = memAsarOpen(a);
+          let touched = 0;
+          for (const t of repackable) {
+            if (t.run(a, opts.check, opts.revert, mem)) touched++;
+          }
+          if (!opts.check && mem.dirtyCount()) {
+            const newSize = mem.flush(".batch-tmp");
+            console.log(`[*] ${a}\n    ${touched} 项补丁合并为一次重打包（新大小 ${newSize.toLocaleString()} 字节）`);
+          }
+        } catch (e) { guardFileBusy(e, a); }
       }
     }
     if (!opts.editAll) {

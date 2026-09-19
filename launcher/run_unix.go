@@ -17,3 +17,6 @@ func runChild(bin string, args []string, env []string) int {
 	fmt.Fprintln(os.Stderr, "zcode-patcher: failed to exec runtime:", err)
 	return 1
 }
+
+// prepareChildConsole is a no-op on unix: the child inherits the terminal as-is.
+func prepareChildConsole() {}

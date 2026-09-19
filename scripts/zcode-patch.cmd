@@ -24,7 +24,7 @@ if not exist "%PATCHER%" (
   exit /b 1
 )
 
-set "ASAR_FLAGS=--usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn"
+set "ASAR_FLAGS=--usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner"
 
 if /i "%~1"=="check" (
   node "%PATCHER%" --check

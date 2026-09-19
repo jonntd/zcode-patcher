@@ -147,3 +147,7 @@ func runChild(bin string, args []string, env []string) int {
 	}
 	return 0
 }
+
+// prepareChildConsole lets the orchestration path (runAndWait) reuse the same
+// console fixes runChild applies before spawning a node child.
+func prepareChildConsole() { prepareWindowsConsole() }

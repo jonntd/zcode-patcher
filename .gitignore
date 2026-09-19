@@ -34,3 +34,8 @@ __pycache__/
 # patches. Not ours to redistribute — never publish it.
 /index.cjs
 
+# ZCode 工作区状态与会话产物（非项目内容）
+.zcode/
+
+# 误拷进 launcher/ 的 shell 包装（embed 只需要五个 JS + 载荷）
+/launcher/zcode-patch

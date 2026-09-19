@@ -1,0 +1,85 @@
+#!/bin/sh
+# zcode-patch —— ZCode 补丁一键管理（macOS / Linux）
+#   zcode-patch          打/重打全部补丁（打完自动启动 ZCode）
+#   zcode-patch check    查看各补丁状态
+#   zcode-patch revert   全部还原
+#   zcode-patch -f       ZCode 在运行时先自动退出再打
+#
+# ZCode 是否在运行的判据（勿改回 pgrep，见文末注释）：
+#   ps -eo comm= | grep -qxE 'ZCode|zcode|.*/(ZCode|zcode)'
+DIR="$HOME/.zcode/patcher"
+J="$DIR/zcode-patcher.js"
+[ -f "$J" ] || { echo "[x] 找不到 $J"; exit 1; }
+
+# 主进程名在 macOS 上是 "ZCode"，Linux 上可能是小写 "zcode" 或完整路径，三种形态都认。
+# 只匹配这三个形态，不会命中 ZCode Helper / zcode-cli / ZCode Computer Use 等旁路进程。
+zcode_running() {
+  ps -eo comm= 2>/dev/null | grep -qxE 'ZCode|zcode|.*/(ZCode|zcode)'
+}
+
+quit_zcode() {
+  if zcode_running; then
+    if [ "$1" = "-f" ]; then
+      echo "[i] 正在退出 ZCode ..."
+      osascript -e 'quit app "ZCode"' 2>/dev/null || true
+      i=0; while zcode_running && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+      if zcode_running; then echo "[x] ZCode 未能退出，放弃"; exit 1; fi
+    else
+      echo "[!] ZCode 正在运行。请先完全退出（⌘Q）后重试，或用: zcode-patch -f"
+      exit 1
+    fi
+  fi
+}
+
+apply_all() {
+  # 单进程一次带齐全部 flag：repack 类补丁在引擎内合并为一次 asar 落盘（MemAsar 批量），
+  # 比逐个 flag 各自重写 307MB 快 3-4 倍
+  node "$J" --usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner --edit-all && \
+  node "$J" && \
+  echo "[√] 全部补丁就绪，启动 ZCode 即可" && (open -a ZCode 2>/dev/null || true)
+}
+
+case "$1" in
+  check)
+    node "$J" --check
+    node "$J" --usage-chart --check
+    node "$J" --menu-width --check
+    node "$J" --continue-btn --check
+    node "$J" --tps-footer --check
+    node "$J" --modelhub --check
+    node "$J" --enhance-btn --check
+    node "$J" --quota-banner --check
+    node "$J" --edit-all --check ;;
+  revert)
+    node "$J" --enhance-btn --revert
+    node "$J" --edit-all --revert
+    node "$J" --revert
+    node "$J" --continue-btn --revert
+    node "$J" --menu-width --revert
+    node "$J" --usage-chart --revert
+    node "$J" --quota-banner --revert
+    node "$J" --tps-footer --revert
+    node "$J" --modelhub --revert
+    echo "[√] 全部还原完成，重启 ZCode 生效" ;;
+  "")
+    quit_zcode
+    apply_all ;;
+  -f)
+    quit_zcode -f
+    apply_all ;;
+  *)
+    echo "用法: zcode-patch [check|revert] 或 zcode-patch -f"; exit 1 ;;
+esac
+
+# 为什么不用 pgrep -xq ZCode：
+#   实测（macOS + Electron 41 打包的 ZCode 3.11.x）pgrep -x 看不见 ZCode 主进程——
+#   同一时刻 ps -eo comm= 里明明有 "ZCode" 这一行，pgrep -x ZCode 却返回 1。
+#   上游 pgrep 对某些进程的匹配存在盲区，而 ps 的 comm 字段始终可靠。
+#   一旦漏报，守卫会误判「未运行」直接开打：asar 被原子替换，但运行中的实例仍握着旧
+#   inode（旧代码），收尾的 open -a ZCode 只是把旧实例切到前台、不会重载，用户会以为
+#   补丁生效了却跑的还是旧代码。
+# 为什么不用 lsappinfo：它只认「有 bundle 并被 LaunchServices 登记」的 App，对在跑的
+#   应用也可能返回空（实测 Finder 在跑时 info -only pid Finder 输出为空），无法区分
+#   「没在跑」和「查不到」；且 Linux 上没有这个命令。
+# 注意 mac 上 ps -o comm 有时给短名（ZCode）、有时给完整路径（/…/MacOS/ZCode），故两种
+#   形态都要认；尾部锚定保证不会命中 ZCode Helper / zcode-cli / ZCode Computer Use。

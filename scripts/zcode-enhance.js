@@ -7,9 +7,15 @@
  *       另提示 enhance-config.json 手动条目；顶部可切简洁/创意模式。
  *       面板指定持久化在 localStorage(zcode-enhance-model)，优先级：
  *       面板指定 > enhance-config.json 手动配置 > 渠道评分；指定的渠道/模型失效时自动回退。
- * 读写：composer 是 Lexical contenteditable（data-testid=v4-composer-input），
- *       读取用 textContent，写入用聚焦后 execCommand(selectAll+insertText)，
- *       由 Lexical 的 beforeinput 处理同步内部 state；不直接改 DOM 属性。
+ * 读写：composer 是 Lexical contenteditable（data-testid=v4-composer-input）。
+ *       正常通路走编辑器模型层：根 DOM 上的 __lexicalEditor 句柄 → toJSON 读草稿、
+ *       parseEditorState + setEditorState 整体替换 —— 清空旧稿与填入新稿是同一个原子状态
+ *       切换，不存在「清一半 / 叠一半」的中间态，段落（换行）结构也按编辑器自身语义保留。
+ *       仅当拿不到句柄或模型层写入抛错时才回退 DOM 通路，且回退里「先确认清空、再填」两步
+ *       各自校验，任一步不确认就报失败走剪贴板兜底 —— 绝不把新文本叠在残留旧稿上。
+ *       之所以不再默认用 execCommand(selectAll + insertText)：execCommand 的 selectAll 只把
+ *       选区落到最后一段文本节点，多段草稿只会删掉最后一段，其余段落会与新内容混在一起
+ *       （这正是「残留 / 覆盖」症状的来源）。
  * 兼容：旧版单参 preload 会丢弃 mode/channel/model —— 检测到即在面板与 toast 中提示重打。
  * 样式：无框、无底色的纯图标按钮（悬停浮出浅色底 + 提亮）；图标为 Gemini 式蓝→紫对角
  *       渐变描边（AI 功能通用视觉语言，去饱和适配深色主题，对比度 ≥3:1）；异常静默不影响主界面。
@@ -53,73 +59,247 @@
   let undoText = null;     // 非空 = 最近一次增强前的原文，可撤销
   let undoTimer = null;
 
-  // ---------- 工具栏行定位（与 zcode-tps.js 同一套） ----------
+  // ---------- 工具栏行定位（与 zcode-tps.js / zcode-continue.js 同一套） ----------
   function findToolbarRow() {
-    const ta = document.querySelector("[data-testid='v4-composer-input']");
+    // 多级锚点：新版(u3+) 输入框在 .chat-composer-input-surface 组件内、toolbar 是
+    // data-chat-toolbar-popover-trigger 按钮组；旧版是 data-testid="v4-composer-input"。
+    // 全部探测，保证结构改版时功能不消失。
+    const NEW_TA = [
+      ".chat-composer-input-surface textarea",
+      ".chat-composer-input-surface [contenteditable='true']",
+      "[data-testid='chat-input']",
+    ];
+    const OLD_TA = "[data-testid='v4-composer-input']";
+    const ta = NEW_TA.map((s) => document.querySelector(s)).find(Boolean)
+      || document.querySelector(OLD_TA)
+      || null;
     if (!ta) return null;
-    const card = ta.closest("form") ? ta.closest("form").parentElement : ta.parentElement;
-    if (!card) return null;
-    for (const el of card.querySelectorAll("div")) {
-      const c = el.className || "";
-      if (/flex[^"]*items-end/.test(c) && (el.textContent || "").includes("完全访问")) return el;
+    const form = ta.closest("form");
+    const scope = form ? (form.parentElement || form) : ta.parentElement;
+    if (!scope) return null;
+    const candidates = [];
+    const collect = (n) => {
+      for (const d of n.querySelectorAll("div")) { candidates.push(d); if (candidates.length > 400) return; }
+    };
+    collect(scope);
+    for (let up = scope.parentElement, i = 0; up && i < 2; up = up.parentElement, i++) {
+      collect(up);
     }
-    return null;
+    candidates.unshift(scope);
+    const scored = candidates.map((el) => {
+      const text = el.textContent || "";
+      const cls = String(el.className || "");
+      let score = 0;
+      if (/flex/.test(cls)) score += 1;
+      if (/items-(end|center)/.test(cls)) score += 1;
+      if (el.querySelector("button,[role='button']")) score += 2;
+      if (el.querySelector(
+        "[data-testid*='send'],[data-testid*='toolbar'],[data-chat-toolbar-popover-trigger='true'],#zcode-enhance-btn,#zcode-continue-btn",
+      )) score += 4;
+      if (text.includes("完全访问")) score += 3;
+      return { el, score };
+    }).filter((x) => x.score >= 3).sort((a, b) => b.score - a.score);
+    return scored[0]?.el || null;
   }
 
   function composerEl() {
-    return document.querySelector("[data-testid='v4-composer-input']");
+    return document.querySelector(".chat-composer-input-surface textarea,.chat-composer-input-surface [contenteditable='true'],[data-testid='chat-input'],[data-testid='v4-composer-input']");
   }
 
   function readDraft() {
     const el = composerEl();
-    return el ? (el.textContent || "").trim() : "";
+    if (!el) return "";
+    const dom = el.textContent || "";
+    const ed = lexEditor(el);
+    if (ed) {
+      // 模型层读出的文本带真实段落换行，DOM 的 textContent 是段落拼接（无分隔）——两者只差空白，
+      // 归一后应一致；不一致说明草稿里有本函数不认识的节点（如 mention），此时以 DOM 读法为准。
+      const model = readViaEditor(ed);
+      if (model != null && normText(model) === normText(dom)) return model.trim();
+    }
+    return dom.trim();
   }
 
-  // Lexical 粘贴多段文本会渲染成多个块级节点，textContent 取出是段落拼接（无换行），
-  // 与目标仅差空白/换行时语义等价，故比较时移除全部空白
+  // ---------- Lexical 模型层读写 ----------
+  // composer 是 Lexical 编辑器的根 DOM：createEditor 在根节点上挂了 __lexicalEditor 句柄，
+  // 通过它拿到模型层，读写都直接操作模型，DOM 由 Lexical 自己保持一致。
+  function lexEditor(el) {
+    try {
+      const ed = el && el.__lexicalEditor;
+      return ed && typeof ed.parseEditorState === "function" && typeof ed.setEditorState === "function"
+        && typeof ed.getEditorState === "function" ? ed : null;
+    } catch (err) { return null; }
+  }
+
+  /** 模型层读原文（含段落换行）。走 EditorState.toJSON（纯 JSON，不依赖 Lexical 内部导出），
+   *  任意一步异常返回 null，由调用方回退 DOM 读法。 */
+  function readViaEditor(ed) {
+    try {
+      const json = ed.getEditorState().toJSON();
+      const out = [];
+      // 块级子节点之间补换行；文本节点取 text，换行节点本身就是 "\n"
+      const walk = (node) => {
+        const kids = (node && node.children) || [];
+        if (!kids.length) {
+          if (node && node.type === "text") out.push(node.text || "");
+          else if (node && node.type === "linebreak") out.push("\n");
+          return;
+        }
+        kids.forEach((kid, i) => { if (i) out.push("\n"); walk(kid); });
+      };
+      walk(json && json.root);
+      return out.join("");
+    } catch (err) { return null; }
+  }
+
+  // Lexical 会同时渲染段落间的空行节点，textContent 取出是「段落拼接 + 空行」，两者都不含
+  // 有意义的空白差异，因此比较一律先剥掉所有空白字符（与原实现的语义等价判定一致）。
   function normText(s) { return String(s || "").replace(/\s+/g, ""); }
-  // Lexical 不认程序化 DOM 选区（Selection API 全选无效）——必须走浏览器编辑命令管线
-  // （execCommand 的 selectAll 会触发 selectionchange，Lexical 由此同步内部选区）。
-  // 单写入原则：一旦检测到「结果已进入输入框但残留原稿」（partial）立即停止，绝不多通道叠加。
+
+  /** 目标文本 → Lexical 序列化状态（按 \n 切段落，与编辑器自身 toJSON 同构）。 */
+  function buildEditorStateJson(text) {
+    const para = (line) => ({
+      children: line ? [{ detail: 0, format: 0, mode: "normal", style: "", text: line, type: "text", version: 1 }] : [],
+      direction: null, format: "", indent: 0, type: "paragraph", version: 1, textFormat: 0, textStyle: "",
+    });
+    return {
+      root: {
+        children: String(text).replace(/\r\n?/g, "\n").split("\n").map(para),
+        direction: null, format: "", indent: 0, type: "root", version: 1,
+      },
+    };
+  }
+
+  /**
+   * 一次原子替换：清空旧内容与填入新文本是同一个 setEditorState，不存在「清一半/叠一半」窗口。
+   * 之后用焦点把光标落到末尾（setEditorState 会把内部选区置空，不补这一步用户接着打字会丢焦点）。
+   */
+  function writeViaEditor(el, ed, text) {
+    const next = ed.parseEditorState(buildEditorStateJson(text));
+    ed.setEditorState(next);
+    // 内部选区为空时 focus 会把光标落到根末尾；若仍为空则连同 DOM 光标一起补一次
+    try { if (typeof ed.focus === "function") ed.focus(); } catch (err) { /* 静默 */ }
+    try {
+      const rng = document.createRange();
+      rng.selectNodeContents(el);
+      rng.collapse(false);
+      const ds = document.getSelection();
+      ds.removeAllRanges();
+      ds.addRange(rng);
+      document.dispatchEvent(new Event("selectionchange"));
+    } catch (err) { /* 静默 */ }
+  }
+
   async function writeDraft(text) {
     const el = composerEl();
     if (!el) return false;
-    const before = normText(el.textContent);
     const want = normText(text);
-    const head = want.slice(0, Math.min(want.length, 40));
-    const judge = () => {
-      const cur = normText(el.textContent);
-      if (cur === want) return "ok";
-      if (cur !== before && cur.includes(head)) return "partial";
-      return "no";
-    };
-    const waitAccept = (timeout) => new Promise((resolve) => {
-      const t0 = Date.now();
-      const tick = () => {
-        const r = judge();
-        if (r !== "no" || Date.now() - t0 > timeout) return resolve(r);
-        setTimeout(tick, 60);
-      };
-      tick();
-    });
-    // 主路径：浏览器管线全选 + 插入（替换语义）
-    el.focus({ preventScroll: true });
-    document.execCommand("selectAll");
-    document.execCommand("insertText", false, text);
-    let r = await waitAccept(800);
-    if (r === "ok") return true;
-    // 第二选择：全选后合成粘贴（execCommand 全选生效时为替换；失效则会在光标处插入）
-    if (r === "no") {
-      el.focus({ preventScroll: true });
-      document.execCommand("selectAll");
-      const data = new DataTransfer();
-      data.setData("text/plain", text);
-      el.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
-      r = await waitAccept(800);
-      if (r === "ok") return true;
+    if (normText(el.textContent) === want) return true;   // 幂等：内容已是目标，免去一次重写
+
+    const ed = lexEditor(el);
+    let viaModel = false;
+    if (ed) {
+      try { writeViaEditor(el, ed, text); viaModel = true; }
+      catch (err) { console.log("[zcode-enhance] 模型层写入失败，回退 DOM 通路:", err && err.message); }
     }
-    console.log("[zcode-enhance] 写回状态:", r, "| 写入前内容:", before.slice(0, 40));
-    return false;   // partial（残留叠加）与 no 都如实报失败，结果走剪贴板兜底
+
+    // 回退通路（没有编辑器句柄 / 模型层写入抛错）：先确认清空，再填。清空不成功绝不插入，
+    // 否则就会叠在原稿上——这正是「残留 + 覆盖」的来源。
+    if (!viaModel) {
+      if (!(await clearDraft(el))) return false;
+      if (!(await fillDraft(el, text))) return false;
+    }
+
+    // 校验：结果必须与目标完全一致（空白归一后），否则如实报失败走剪贴板兜底，绝不静默留下混合内容
+    const t0 = Date.now();
+    while (Date.now() - t0 < 900) {
+      if (normText(el.textContent) === want) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    console.log("[zcode-enhance] 写回未确认:", JSON.stringify((el.textContent || "").slice(0, 60)));
+    return false;
+  }
+
+  /**
+   * 回退通路专用：把 DOM 选区铺满整个编辑器，再让 Lexical 走它自己的 beforeinput 管线删掉这段选区。
+   * 关键点：execCommand('selectAll') 只把浏览器选区落在最后一段文本节点（0..该段长度），
+   * 单段草稿看着没事，多段草稿就只删掉最后一段 —— 剩下的段落被随后的插入顶走，就成了「残留 + 覆盖」。
+   * deleteByCut 是唯一会被 Lexical 转成 REMOVE_TEXT（真删选区）的输入类型；deleteContent 走的是
+   * 删单字符（DELETE_CHARACTER），对多段选区完全无效。
+   */
+  async function clearDraft(el) {
+    const empty = () => !(el.textContent || "").trim();
+    const settle = async (ms) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        if (empty()) return true;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return empty();
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // ① Lexical 在管这条通路时唯一有效的删法（真删选区，含跨段）
+      try {
+        el.focus({ preventScroll: true });
+        const rng = document.createRange();
+        rng.selectNodeContents(el);
+        const ds = document.getSelection();
+        ds.removeAllRanges();
+        ds.addRange(rng);
+        document.dispatchEvent(new Event("selectionchange"));   // 显式催 Lexical 同步内部选区
+        el.dispatchEvent(new InputEvent("beforeinput", { inputType: "deleteByCut", bubbles: true, cancelable: true }));
+      } catch (err) { /* 静默：交给下面的原生通路 */ }
+      if (await settle(400)) return true;
+      // ② 非 Lexical（或编辑器未接管该事件）时的原生通路：先删当前选区，再退到全选删除
+      try {
+        el.focus({ preventScroll: true });
+        document.execCommand("delete");
+      } catch (err) { /* 静默 */ }
+      if (await settle(300)) return true;
+      try {
+        el.focus({ preventScroll: true });
+        document.execCommand("selectAll");
+        document.execCommand("delete");
+      } catch (err) { /* 静默 */ }
+      if (await settle(300)) return true;
+    }
+    console.log("[zcode-enhance] 清空输入框失败，放弃写入以免叠加残留");
+    return false;
+  }
+
+  /** 回退通路专用：草稿已确认清空后再填。
+   *  逐行写，每步都先试编辑器管线再退到 execCommand —— 两条通路的有效机制不同：
+   *  Lexical 只认 beforeinput（execCommand('insertParagraph') 被它忽略），普通 contenteditable
+   *  则相反（合成 beforeinput 只是通知事件，不会真的插入）。每行写完都轮询确认落进去了，
+   *  没有落进去才补一次 execCommand，避免在某一边静默丢内容。 */
+  async function fillDraft(el, text) {
+    const waitFor = async (pred, ms) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        if (pred()) return true;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      return pred();
+    };
+    try {
+      el.focus({ preventScroll: true });
+      const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (i) {
+          const before = el.innerHTML;
+          el.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertParagraph", bubbles: true, cancelable: true }));
+          if (!(await waitFor(() => el.innerHTML !== before, 150))) document.execCommand("insertParagraph");
+        }
+        if (lines[i]) {
+          const len0 = (el.textContent || "").length;
+          el.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertText", data: lines[i], bubbles: true, cancelable: true }));
+          if (!(await waitFor(() => (el.textContent || "").length > len0, 150))) {
+            document.execCommand("insertText", false, lines[i]);
+          }
+        }
+      }
+      return true;
+    } catch (err) { return false; }
   }
 
   // ---------- toast ----------
@@ -199,7 +379,7 @@
     const b = document.createElement("button");
     b.id = BTN_ID;
     b.type = "button";
-    b.title = "增强提示词（单击增强 · 右键选模型/模式）";
+    b.title = "增强提示词（单击 / Ctrl+/ 增强 · 右键选模型/模式）";
     b.appendChild(makeSparkSvg());
     Object.assign(b.style, {
       display: "inline-flex", alignItems: "center", gap: "4px",
@@ -220,9 +400,40 @@
 
   function setBusy(b, on) {
     busy = on;
+    if (!b) return;
     b.classList.toggle("zenh-busy", on);
     b.style.opacity = on ? "0.75" : "1";
     b.style.pointerEvents = on ? "none" : "auto";
+  }
+
+  // 快捷键（Ctrl+/）—— 无平台分支：Mac 与 Windows/Linux 都用 Ctrl，判定只看 ev.key + 修饰键。
+  // 只在输入框聚焦时生效：光标不在 composer 里（弹窗、别的输入框、终端）一律不拦截，
+  // 避免把用户的 Ctrl+/ 吞掉。capture 阶段拿事件，早于 Lexical 的根节点 keydown 处理，
+  // 配合 preventDefault 让「/」不会被当作字符插入、也不会触发应用的「/」能力菜单。
+  function composerFocused() {
+    const el = composerEl();
+    if (!el) return false;
+    const a = document.activeElement;
+    return !!a && (a === el || el.contains(a));
+  }
+
+  // ev.key 取的是「按布局实际打出的字符」，所以这里不能用 code（Slash）或 keyCode 判定：
+  // 非 US 布局（德语区 / 法语 AZERTY 等）上 "/" 本身就要 Shift 才打得出来，此时必须接受
+  // shiftKey 才按得动。安全性由 key === "/" 这条守住：US 布局上 Ctrl+Shift+Slash 打出的是
+  // "?"，字符不符直接不命中，因此放开 shift 不会让 Ctrl+Shift+/ 误触发。
+  function isHotkey(ev) {
+    return ev.key === "/" && ev.ctrlKey && !ev.metaKey && !ev.altKey;
+  }
+
+  function onHotkey(ev) {
+    if (ev.defaultPrevented || ev.isComposing) return;      // 组字中/已被别处处理，不抢
+    if (ev.repeat) return;
+    if (!isHotkey(ev)) return;
+    if (document.getElementById("zenh-picker-root")) return; // 选模型面板开着时把按键让给面板
+    if (!composerFocused()) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    run();
   }
 
   // ---------- 模型/模式选择面板（右键） ----------
@@ -386,10 +597,12 @@
         if (existing) existing.remove();
         return;
       }
-      // 中组容器 = row 直接子级中含「完全访问」的（隐藏下拉菜单也在此容器内，末尾即可见按钮之后）
+      // 中组容器 = row 直接子级中含「完全访问」（旧版）或新版 tool 触发器按钮组
       let mid = null;
       for (const el of row.children) {
-        if ((el.textContent || "").includes("完全访问")) { mid = el; break; }
+        const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
+          || el.querySelector("[data-testid*='toolbar'],[data-testid*='send']");
+        if ((el.textContent || "").includes("完全访问") || isToolbarGroup) { mid = el; break; }
       }
       if (!existing) existing = makeBtn();
       if (mid) {
@@ -417,6 +630,7 @@
       });
       mo.observe(document.body, { childList: true, subtree: true });
     } catch (err) { /* 静默 */ }
+    try { document.addEventListener("keydown", onHotkey, true); } catch (err) { /* 静默 */ }
     scan();
   }
   if (document.body) start();

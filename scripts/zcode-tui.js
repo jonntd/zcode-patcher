@@ -25,10 +25,9 @@ const readline = require("readline");
 
 const SCRIPT = path.join(__dirname, "zcode-patcher.js");
 const isTTY = process.stdin.isTTY && process.stdout.isTTY;
-// 可选：直接传一个安装根目录，透传给子进程作为目标。
-const targetArg = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : "";
-// 非交互子命令（小写，走 --xxx 统一透传到 tui 而非 CLI）。
-const isNonInteractive = () => process.argv.some((a) => [ "--status", "--check-all", "--apply-all", "--revert-all" ].includes(a));
+// 可选：直接传一个安装根目录，允许放在任意 flag 前后，透传给子进程作为目标。
+// TUI 自身没有需要额外值的 flag，因此唯一的非 flag 参数就是目标路径。
+const targetArg = process.argv.slice(2).find((a) => !a.startsWith("--")) || "";
 
 // 每个补丁：显示名 + 传给 zcode-patcher.js 的功能 flag。
 // 打=传该 flag；还原=传该 flag 再叠 --revert；查状态=传该 flag 再叠 --check。
@@ -57,6 +56,7 @@ const Ansi = {
   GREY: "\x1b[90m",
   GREEN: "\x1b[32m",
   YELLOW: "\x1b[33m",
+  RED: "\x1b[31m",
   CYAN: "\x1b[36m",
   INV: "\x1b[7m",
 };
@@ -67,6 +67,7 @@ const badge = {
   applied: color("已打", Ansi.GREEN),
   partial: color("部分/异常", Ansi.YELLOW),
   not: color("未打", Ansi.GREY),
+  na: color("不适用", Ansi.GREY),
   unknown: color("未知", Ansi.YELLOW),
 };
 
@@ -75,15 +76,66 @@ function runPatcher(args) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [SCRIPT, ...args], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
+    let spawnError = null;
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (out += d));
-    child.on("close", (code) => resolve({ code: code || 0, out }));
+    child.on("error", (err) => { spawnError = err; });
+    child.on("close", (code, signal) => resolve({
+      code: typeof code === "number" ? code : 1,
+      signal,
+      error: spawnError,
+      out,
+    }));
   });
+}
+
+function resultFailed(result) { return !result || result.code !== 0 || result.error; }
+function resultReason(result) {
+  const lines = String(result?.error?.message || result?.out || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (!lines.length) return `无输出（退出码 ${result?.code ?? 1}）`;
+  // 报行优先：跳过 “=== 模式 ===” 标题和纯路径行，取真正的诊断/告警行
+  return lines.find((l) => l.includes("跳过") || l.includes("失败") || l.includes("无法"))
+    || lines.find((l) => l.includes("[!]") && l.length > 20)
+    || lines.find((l) => !l.startsWith("==="))
+    || lines[lines.length - 1];
+}
+function shortReason(text, max = 32) {
+  const t = (text || "").trim();
+  return t.length > max ? t.slice(0, max) + "…" : t;
+}
+function reportFailure(label, result) {
+  if (!resultFailed(result)) return;
+  console.error(`[!] ${label}失败：${resultReason(result)}`);
+}
+
+async function executePatch(row, revert) {
+  const call = []
+    .concat(row.flag === "" ? [] : [row.flag])
+    .concat(revert ? ["--revert"] : [])
+    .concat(targetArg ? [targetArg] : []);
+  const applied = await runPatcherInherit(call);
+  if (resultFailed(applied)) {
+    row.state = "unknown";
+    row.reason = resultReason(applied);
+    reportFailure(row.name, applied);
+    return { ok: false, checked: false };
+  }
+  const checked = await runPatcher([row.flag, "--check", targetArg].filter(Boolean));
+  if (resultFailed(checked)) {
+    row.state = "unknown";
+    row.reason = resultReason(checked);
+    reportFailure(`${row.name} 状态检查`, checked);
+    return { ok: false, checked: false };
+  }
+  row.state = classify(checked.out);
+  row.reason = row.state === "unknown" ? resultReason(checked) : "";
+  return { ok: row.state !== "partial" && row.state !== "unknown", checked: true };
 }
 
 /** 由 --check 输出推导状态：'applied' | 'partial' | 'not' | 'unknown'。 */
 function classify(out) {
   const text = out || "";
+  if (text.includes("暂不支持")) return "na";   // 锚点体系明确判定的「不适用」，与「未打」区分开
   if (text.includes("部分") || text.includes("异常") || text.includes("不完整")) return "partial";
   if (text.includes("已打")) return "applied";
   if (text.includes("未打") || text.includes("已还原") || text.includes("没有备份")) return "not";
@@ -102,7 +154,8 @@ function showOverview(rows) {
     const cnt = { applied: 0, partial: 0, not: 0, unknown: 0 };
     rows.forEach((r, i) => {
       cnt[r.state] = (cnt[r.state] || 0) + 1;
-      out.push(` ${(i + 1).toString().padStart(2)}. ${r.name.padEnd(16)} ${badge[r.state]}`);
+      const why = r.state === "unknown" && r.reason ? `（${shortReason(r.reason)}）` : "";
+      out.push(` ${(i + 1).toString().padStart(2)}. ${r.name.padEnd(16)} ${badge[r.state]}${why}`);
     });
     out.push("");
     out.push(color(`已打 ${cnt.applied} · 部分/异常 ${cnt.partial} · 未打 ${cnt.not} · 未知 ${cnt.unknown}`, Ansi.GREY));
@@ -122,17 +175,18 @@ function totalItems(rows) { return rows.length + 2; }
 
 // 非交互状态文本：`--status`/`--check-all` 时打印，供脚本/CI 消费。
 function statusText(rows) {
-  const cnt = { applied: 0, partial: 0, not: 0, unknown: 0 };
+  const cnt = { applied: 0, partial: 0, not: 0, na: 0, unknown: 0 };
   const body = rows.map((r, i) => {
     cnt[r.state] = (cnt[r.state] || 0) + 1;
-    return ` ${(i + 1).toString().padStart(2)}. ${r.name.padEnd(16)} ${badge[r.state]}`;
+    const reason = r.state === "unknown" && r.reason ? `（${r.reason}）` : "";
+    return ` ${(i + 1).toString().padStart(2)}. ${r.name.padEnd(16)} ${badge[r.state]}${reason}`;
   });
   return [
     color("ZCode 补丁状态", Ansi.BOLD),
     "",
     ...body,
     "",
-    color(`已打 ${cnt.applied} · 部分/异常 ${cnt.partial} · 未打 ${cnt.not} · 未知 ${cnt.unknown}`, Ansi.GREY),
+    color(`已打 ${cnt.applied} · 部分/异常 ${cnt.partial} · 未打 ${cnt.not} · 不适用 ${cnt.na} · 未知 ${cnt.unknown}`, Ansi.GREY),
   ].join("\n");
 }
 
@@ -152,7 +206,9 @@ function render(rows, sel, busyIdx) {
       line = ` ${mark} ${name}`;
     } else {
       const r = it.row;
-      const state = busyIdx === i ? color("… 执行中", Ansi.CYAN) : badge[r.state];
+      const state = busyIdx === i
+        ? color("… 执行中", Ansi.CYAN)
+        : badge[r.state] + (r.state === "unknown" && r.reason ? `（${shortReason(r.reason)}）` : "");
       const name = cur ? color(r.name, Ansi.BOLD) : r.name;
       line = ` ${mark} ${name.padEnd(16)} ${state}`;
     }
@@ -179,8 +235,12 @@ async function main() {
   const rows = PATCHES.map((p) => ({ ...p, state: "unknown" }));
   await Promise.all(
     rows.map(async (r) => {
-      const { out } = await runPatcher([r.flag, "--check", targetArg].filter(Boolean));
-      r.state = classify(out);
+      const result = await runPatcher([r.flag, "--check", targetArg].filter(Boolean));
+      const st = resultFailed(result) ? "unknown" : classify(result.out);
+      r.state = st;
+      // 未知状态必须带原因（检查失败/目标不可用/版本锚点失配），不能裸显示“未知”
+      r.reason = resultFailed(result) || st === "unknown" ? resultReason(result) : "";
+      r.check = result;
     }),
   );
 
@@ -193,7 +253,12 @@ async function main() {
   if (wantStatus) {
     const code = rows.some((r) => r.state === "partial" || r.state === "unknown") ? 2 : 0;
     if (wantJSON) {
-      process.stdout.write(JSON.stringify(rows.map((r) => ({ name: r.name, flag: r.flag || "(default)", state: r.state })), null, 2) + "\n");
+      process.stdout.write(JSON.stringify(rows.map((r) => ({
+        name: r.name,
+        flag: r.flag || "(default)",
+        state: r.state,
+        ...(r.reason ? { reason: r.reason } : {}),
+      })), null, 2) + "\n");
     } else {
       console.log(statusText(rows));
     }
@@ -201,19 +266,28 @@ async function main() {
   }
 
   if (wantApplyAll || wantRevertAll) {
-    const targets = wantRevertAll ? rows : rows.filter((r) => r.state !== "applied");
-    let code = 0;
-    for (const r of targets) {
-      const call = []
-        .concat(r.flag === "" ? [] : [r.flag])
+    // 单进程一次带齐全部 flag：引擎内 MemAsar 把 repack 类补丁合并为一次 asar 落盘，
+    // 比逐项各调一次快 3-4 倍。跑完统一并行重检，状态以重检为准。
+    // 思考等级补丁（flag=""）不走 asar 批量，裸调用一次；--edit-all 会短路它，必须单跑
+    const ran = await runPatcherInherit(
+      PATCHES.map((p) => p.flag).filter(Boolean)
         .concat(wantRevertAll ? ["--revert"] : [])
-        .concat(targetArg ? [targetArg] : []);
-      await runPatcherInherit(call);
-      const { out } = await runPatcher([r.flag, "--check", targetArg].filter(Boolean));
-      r.state = classify(out);
-      if (r.state === "partial" || r.state === "unknown") code = 2; // 部分/未知 ⇒ 非零
-    }
-    console.log(color(`完毕：${wantRevertAll ? "还原" : "应用"} ${targets.length} 项补丁`, code ? Ansi.RED : Ansi.GREEN));
+        .concat(targetArg ? [targetArg] : []),
+    );
+    await runPatcherInherit(targetArg ? [targetArg] : []);
+    await Promise.all(rows.map(async (r) => {
+      const checked = await runPatcher([r.flag, "--check", targetArg].filter(Boolean));
+      if (resultFailed(checked)) { r.state = "unknown"; r.reason = resultReason(checked); return; }
+      r.state = classify(checked.out);
+      r.reason = r.state === "unknown" ? resultReason(checked) : "";
+    }));
+    const failed = rows.filter((r) => r.state === "partial" || r.state === "unknown").length;
+    const na = rows.filter((r) => r.state === "na").length;
+    let code = failed ? 2 : 0;
+    if (resultFailed(ran)) code = 2;
+    const summary = failed ? `失败 ${failed} 项` : "全部成功";
+    const skipNote = na ? `，不适用跳过 ${na} 项` : "";
+    console.log(color(`完毕：${wantRevertAll ? "还原" : "应用"} ${rows.length - na} 项补丁（${summary}${skipNote}）`, code ? Ansi.RED : Ansi.GREEN));
     process.exit(code);
   }
 
@@ -263,13 +337,7 @@ async function main() {
         const row = item.row;
         // 已应用或部分应用→先还原（部分需先还原才能重打）；其余→打
         const revert = row.state === "applied" || row.state === "partial";
-        const call = []
-          .concat(row.flag === "" ? [] : [row.flag])
-          .concat(revert ? ["--revert"] : [])
-          .concat(targetArg ? [targetArg] : []);
-        await runPatcherInherit(call);
-        const { out } = await runPatcher([row.flag, "--check", targetArg].filter(Boolean));
-        row.state = classify(out);
+        await executePatch(row, revert);
         busy = false; busyIdx = -1;
         render(rows, sel, busyIdx);
         return;
@@ -277,7 +345,7 @@ async function main() {
       // --- 批量动作：先确认，避免误触整组改动 ---
       const batch = item.batch;
       const targets = batch.kind === "apply-all"
-        ? rows.filter((r) => r.state !== "applied")   // 未打/部分/未知→打
+        ? rows.filter((r) => r.state !== "applied" && r.state !== "na")   // 未打/部分/未知→打；不适用项跳过
         : rows;                                        // 全还原
       if (targets.length === 0) {
         console.log(color("（没有需要执行的项）", Ansi.YELLOW));
@@ -285,16 +353,15 @@ async function main() {
       } else {
         const ok = await confirmDialog(`${batch.name}？（${targets.length} 项） [y]执行 [n]取消`);
         if (ok) {
+          let failed = 0;
           for (const r of targets) {
-            const revert = batch.kind === "revert-all";
-            const call = []
-              .concat(r.flag === "" ? [] : [r.flag])
-              .concat(revert ? ["--revert"] : [])
-              .concat(targetArg ? [targetArg] : []);
-            await runPatcherInherit(call);
-            const { out } = await runPatcher([r.flag, "--check", targetArg].filter(Boolean));
-            r.state = classify(out);
+            const result = await executePatch(r, batch.kind === "revert-all");
+            if (!result.ok) failed++;
           }
+          console.log(color(
+            `批量操作完成：成功 ${targets.length - failed} 项，失败 ${failed} 项`,
+            failed ? Ansi.RED : Ansi.GREEN,
+          ));
         }
       }
       busy = false; busyIdx = -1;
@@ -322,7 +389,13 @@ function confirmDialog(prompt) {
 function runPatcherInherit(args) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [SCRIPT, ...args], { stdio: "inherit" });
-    child.on("close", (code) => resolve(code || 0));
+    let spawnError = null;
+    child.on("error", (err) => { spawnError = err; });
+    child.on("close", (code, signal) => resolve({
+      code: typeof code === "number" ? code : 1,
+      signal,
+      error: spawnError,
+    }));
   });
 }
 

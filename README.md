@@ -4,6 +4,8 @@ ZCode 客户端本地补丁工具。零依赖 Node.js 脚本 + Go 单文件启�
 
 9 项补丁：思考等级透传、全消息可编辑、用量页去截断、模型菜单加宽、继续按钮、TPS 统计栏、模型拉取、增强提示词按钮、去额度骚扰横幅。全部幂等、可检查、可还原。
 
+> **思考等级透传 × ZCode ≥3.12**：新内核已移除档位换算函数（providerOptionsByLevel 仅存 schema），补丁在 3.12+ 显示「不适用」是预期行为。原生替代：设置 → 模型设置 → 对应模型的「推理档位映射」，按档位直接 set/unset 任意配置路径（如 `reasoningEffort`、`thinking.budgetTokens`），能力等价且可视化。
+
 ## 原理
 
 ```
@@ -47,17 +49,27 @@ zcode-patch-win-x64.exe            # Windows
 ./zcode-patch-macos-arm64 --status            # 状态报告
 ./zcode-patch-macos-arm64 --json              # JSON，供脚本解析
 ./zcode-patch-macos-arm64 --apply-all         # 一键全打
+./zcode-patch-macos-arm64 --apply-all -f      # 一键全打；ZCode 在跑时自动优雅退出，打完自动拉起
+./zcode-patch-macos-arm64 -f --quota-banner   # 单个补丁也支持 -f（打前自动退出，完成后不拉起）
 ./zcode-patch-macos-arm64 --revert-all        # 一键全还原
 ```
 
+`-f` / `--force` 是运行中守卫：`--apply-all` 或裸 `-f` 检测到 ZCode 正在运行时，不带 `-f` 会直接拒绝（避免换了 asar 但运行中的实例还握着旧代码的「假生效」）；带 `-f` 则优雅退出（osascript / CloseMainWindow / SIGTERM，绝不强杀），最多等 20 秒，退不干净就放弃。`--check` / `--status` / `--revert` 等只读或还原参数不加守卫，与 shell 版 `scripts/zcode-patch` 行为一致。
+
 `--status` / `--json` 全程只读，不改任何补丁；任一补丁为 `partial`/`unknown` 时退出码为 2，全部正常为 0。
+
+**关于 `unknown`（未知）**：只有当检查子进程能明确判定 已打/未打/不完整 时才显示对应状态；其余情况（如 ZCode 升级后渲染层结构变化导致锚点失配、文件被占用无法读取）标为 `unknown`，并且会紧跟一条简短原因——`--status` / `--json` / 交互菜单总览里都会显示，例如 `未知（renderer 内容锚点命中 0 个文件，版本结构可能已变，跳过）`。按 Enter 仍会尝试执行，成功后会重新检查并刷新状态。
+
+升级兼容：渲染层锚点按 ZCode 版本分组适配（如「去额度骚扰横幅」同时内置旧版三元档位与新版提醒式横幅两代锚点组），运行时会自动选用命中的那组，老版本部署与新版本都能正确判读与还原。
 
 `--json` 输出示例：
 
 ```json
 [
   { "name": "思考等级透传", "flag": "(default)",  "state": "applied" },
-  { "name": "全消息可编辑", "flag": "--edit-all", "state": "applied" }
+  { "name": "全消息可编辑", "flag": "--edit-all", "state": "applied" },
+  { "name": "模型拉取",     "flag": "--modelhub",  "state": "unknown",
+    "reason": "renderer 内容锚点命中 0 个文件（期望 1），版本结构可能已变，跳过" }
 ]
 ```
 
