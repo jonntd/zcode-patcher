@@ -405,6 +405,46 @@ function memAsarOpen(asar) {
     set(p, buf) { if (!overrides.has(p)) dirty++; overrides.set(p, buf); },
     del(p) { if (!overrides.has(p)) dirty++; overrides.set(p, null); },
     dirtyCount: () => dirty,
+    /** package.json 条目错位自愈：早期 double-flush 事故会把顶层条目指针写到
+     *  错误位置（812B 残片），但原始 JSON 原文仍完整躺在文件末尾。检测头部
+     *  特征，缺失时按特征字节找回并覆写条目，随批量 flush 落盘修复。
+     *  正常包返回 false 零成本（仅一次 24B 前缀比较）；checkOnly 只报错不改。 */
+    healPkgJson(checkOnly) {
+      const head = Buffer.from('{\n  "name": "@zcode/desk', "utf8");
+      const cur = this.get("package.json");
+      if (cur && cur.length >= head.length && cur.subarray(0, head.length).equals(head)) return false;
+      const at = raw.indexOf(head);
+      if (at < 0) {
+        console.log(`[!] ${asar}\n    package.json 头部异常且找不到原始原文，拒绝猜测；先还原备份或重装`);
+        return true;
+      }
+      // 从特征处按括号平衡截取完整 JSON 对象
+      let depth = 0, i = at, inStr = false, esc = false;
+      for (; i < raw.length && depth >= 0; i++) {
+        const c = raw[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (c === 92) esc = true;   // "\\"
+          else if (c === 34) inStr = false; // '"'
+        } else if (c === 34) inStr = true;
+        else if (c === 123) depth++;        // '{'
+        else if (c === 125 && --depth === 0) { i++; break; } // '}'
+      }
+      const restored = raw.subarray(at, i);
+      let ok = false;
+      try { ok = JSON.parse(restored.toString("utf8")).name === "@zcode/desktop"; } catch { ok = false; }
+      if (!ok) {
+        console.log(`[!] ${asar}\n    package.json 原文残留不可解析（${restored.length} 字节），拒绝盲修`);
+        return true;
+      }
+      if (checkOnly) {
+        console.log(`[!] ${asar}\n    package.json 条目错位（当前 ${cur ? cur.length : 0} 字节），原文仍在文件末尾，重跑任意补丁可自愈`);
+        return true;
+      }
+      this.set("package.json", restored);
+      console.log(`[*] ${asar}\n    package.json 条目错位自愈：已回收末尾原文 ${restored.length} 字节并重定位`);
+      return true;
+    },
     deferSide(fn) { deferredSides.push(fn); },
     flush(tmpSuffix) {
       if (!dirty) {
@@ -1426,20 +1466,30 @@ function processModelhub(asar, checkOnly, revert, mem) {
     return null;
   };
 
-  // renderer 大文件定位：内容锚点判定 v1/v2/v3（旧版 ADD_BTN/QPT 组合 vs vRt vs mbn 调用点）。
+  // renderer 大文件定位：内容锚点判定 v1/v2/v3/v4（旧版 ADD_BTN/QPT 组合 vs vRt vs mbn vs _bn 调用点）。
   // 哈希文件名随版本构建变化，一律不硬编码；期望恰有一版命中唯一文件。
   // v3 = 3.12.x：压缩器把模型设置组件从 vRt 改名为 mbn（providerName 格式化函数 gw→nN），
   // 参数表/调用点作用域变量（w/E/O）与注入块完全不变，仅锚点串内的符号名漂移。
+  // v4 = 3.14.1：组件 mbn→_bn、格式化函数 nN→Kk，参数表与作用域变量依旧不动，仅锚点串符号再漂。
+  // v5 = 3.14.3：组件 _bn→txn、格式化函数 Kk→nN，参数表与作用域变量依旧不动，仅锚点串符号再漂。
   const v1Bufs = [Buffer.from(ph.ORIG_ADD_BTN, "utf8"), Buffer.from(ph.ORIG_QPT, "utf8")];
   const v2Buf = Buffer.from(ph.RENDER_V2_ANCHOR, "utf8");
   const v3Buf = ph.RENDER_V3_ANCHOR ? Buffer.from(ph.RENDER_V3_ANCHOR, "utf8") : null;
-  // v2.1/v3.1（模型列表头部）三点注入的字节：签名形参 / 调用点传参 / 头部按钮
+  const v4Buf = ph.RENDER_V4_ANCHOR ? Buffer.from(ph.RENDER_V4_ANCHOR, "utf8") : null;
+  const v5Buf = ph.RENDER_V5_ANCHOR ? Buffer.from(ph.RENDER_V5_ANCHOR, "utf8") : null;
+  // v2.1/v3.1/v4.1/v5.1（模型列表头部）三点注入的字节：签名形参 / 调用点传参 / 头部按钮
   const v2SigOld = ph.RENDER_V2_SIG_OLD ? Buffer.from(ph.RENDER_V2_SIG_OLD, "utf8") : null;
   const v2SigNew = ph.RENDER_V2_SIG_NEW ? Buffer.from(ph.RENDER_V2_SIG_NEW, "utf8") : null;
   const v2PropBuf = ph.RENDER_V2_INSERT ? Buffer.from(ph.RENDER_V2_INSERT, "utf8") : null;
   const v3SigOld = ph.RENDER_V3_SIG_OLD ? Buffer.from(ph.RENDER_V3_SIG_OLD, "utf8") : null;
   const v3SigNew = ph.RENDER_V3_SIG_NEW ? Buffer.from(ph.RENDER_V3_SIG_NEW, "utf8") : null;
   const v3PropBuf = ph.RENDER_V3_INSERT ? Buffer.from(ph.RENDER_V3_INSERT, "utf8") : null;
+  const v4SigOld = ph.RENDER_V4_SIG_OLD ? Buffer.from(ph.RENDER_V4_SIG_OLD, "utf8") : null;
+  const v4SigNew = ph.RENDER_V4_SIG_NEW ? Buffer.from(ph.RENDER_V4_SIG_NEW, "utf8") : null;
+  const v4PropBuf = ph.RENDER_V4_INSERT ? Buffer.from(ph.RENDER_V4_INSERT, "utf8") : null;
+  const v5SigOld = ph.RENDER_V5_SIG_OLD ? Buffer.from(ph.RENDER_V5_SIG_OLD, "utf8") : null;
+  const v5SigNew = ph.RENDER_V5_SIG_NEW ? Buffer.from(ph.RENDER_V5_SIG_NEW, "utf8") : null;
+  const v5PropBuf = ph.RENDER_V5_INSERT ? Buffer.from(ph.RENDER_V5_INSERT, "utf8") : null;
   const v2HdrAnchor = ph.RENDER_V2_HDR_ANCHOR ? Buffer.from(ph.RENDER_V2_HDR_ANCHOR, "utf8") : null;
   const v2HdrInsert = ph.RENDER_V2_HDR_INSERT ? Buffer.from(ph.RENDER_V2_HDR_INSERT, "utf8") : null;
   // 旧版 v2（独立行按钮）整块注入串：仅为已打旧版的原地升级/还原保留
@@ -1476,25 +1526,31 @@ function processModelhub(asar, checkOnly, revert, mem) {
     const isV1 = v1Bufs.some((x) => b.includes(x));
     const isV2 = b.includes(v2Buf);
     const isV3 = v3Buf && b.includes(v3Buf);
-    if (isV1 || isV2 || isV3) found.push({ path: p, isV1, isV2, isV3 });
+    const isV4 = v4Buf && b.includes(v4Buf);
+    const isV5 = v5Buf && b.includes(v5Buf);
+    if (isV1 || isV2 || isV3 || isV4 || isV5) found.push({ path: p, isV1, isV2, isV3, isV4, isV5 });
   });
   const v1hits = found.filter((f) => f.isV1);
   const v2hits = found.filter((f) => f.isV2);
   const v3hits = found.filter((f) => f.isV3);
+  const v4hits = found.filter((f) => f.isV4);
+  const v5hits = found.filter((f) => f.isV5);
   let mode = null;
   let rendRel = null;
-  if (v1hits.length === 1 && v2hits.length === 0 && v3hits.length === 0) { mode = "v1"; rendRel = v1hits[0].path; }
-  else if (v2hits.length === 1 && v1hits.length === 0 && v3hits.length === 0) { mode = "v2"; rendRel = v2hits[0].path; }
-  else if (v3hits.length === 1 && v1hits.length === 0 && v2hits.length === 0) { mode = "v3"; rendRel = v3hits[0].path; }
+  if (v1hits.length === 1 && v2hits.length === 0 && v3hits.length === 0 && v4hits.length === 0 && v5hits.length === 0) { mode = "v1"; rendRel = v1hits[0].path; }
+  else if (v2hits.length === 1 && v1hits.length === 0 && v3hits.length === 0 && v4hits.length === 0 && v5hits.length === 0) { mode = "v2"; rendRel = v2hits[0].path; }
+  else if (v3hits.length === 1 && v1hits.length === 0 && v2hits.length === 0 && v4hits.length === 0 && v5hits.length === 0) { mode = "v3"; rendRel = v3hits[0].path; }
+  else if (v4hits.length === 1 && v1hits.length === 0 && v2hits.length === 0 && v3hits.length === 0 && v5hits.length === 0) { mode = "v4"; rendRel = v4hits[0].path; }
+  else if (v5hits.length === 1 && v1hits.length === 0 && v2hits.length === 0 && v3hits.length === 0 && v4hits.length === 0) { mode = "v5"; rendRel = v5hits[0].path; }
   else {
-    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} v2=${v2hits.length} v3=${v3hits.length} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
+    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} v2=${v2hits.length} v3=${v3hits.length} v4=${v4hits.length} v5=${v5hits.length} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
     return false;
   }
-  // 当前生效字节集：v3 与 v2 仅组件符号名不同，注入块/HDR 系共享（payload V3 字段缺省时回落 V2 以兼容旧载荷）
-  const sigOldBuf = mode === "v3" ? (v3SigOld || v2SigOld) : v2SigOld;
-  const sigNewBuf = mode === "v3" ? (v3SigNew || v2SigNew) : v2SigNew;
-  const callAnchorBuf = mode === "v3" ? (v3Buf || v2Buf) : v2Buf;
-  const propBuf = mode === "v3" ? (v3PropBuf || v2PropBuf) : v2PropBuf;
+  // 当前生效字节集：v5 与 v4/v3/v2 仅组件符号名不同，注入块/HDR 系共享（payload V5/V4/V3 字段缺省时逐级回落以兼容旧载荷）
+  const sigOldBuf = mode === "v5" ? (v5SigOld || v4SigOld || v3SigOld || v2SigOld) : mode === "v4" ? (v4SigOld || v3SigOld || v2SigOld) : mode === "v3" ? (v3SigOld || v2SigOld) : v2SigOld;
+  const sigNewBuf = mode === "v5" ? (v5SigNew || v4SigNew || v3SigNew || v2SigNew) : mode === "v4" ? (v4SigNew || v3SigNew || v2SigNew) : mode === "v3" ? (v3SigNew || v2SigNew) : v2SigNew;
+  const callAnchorBuf = mode === "v5" ? (v5Buf || v4Buf || v3Buf || v2Buf) : mode === "v4" ? (v4Buf || v3Buf || v2Buf) : mode === "v3" ? (v3Buf || v2Buf) : v2Buf;
+  const propBuf = mode === "v5" ? (v5PropBuf || v4PropBuf || v3PropBuf || v2PropBuf) : mode === "v4" ? (v4PropBuf || v3PropBuf || v2PropBuf) : mode === "v3" ? (v3PropBuf || v2PropBuf) : v2PropBuf;
   if (!mem.has(MH_PRELOAD_REL) || !mem.has(MH_MAIN_REL)) {
     console.log(`[!] ${asar}\n    缺少 preload/main 条目，版本结构可能已变，跳过`);
     return false;
@@ -1729,8 +1785,10 @@ function processModelhub(asar, checkOnly, revert, mem) {
       mem.set(MH_PRELOAD_REL, preNew);
       preFixed = true;
     }
-    // sidecar 保留（仍持有首打时的干净原件，供 revert 兜底）；flush 内部刷新 asar_size
-    mem.flush(".modelhub-tmp");
+    // sidecar 保留（仍持有首打时的干净原件，供 revert 兜底）。
+    // 注意：这里绝不提前 flush——批量模式下本 mem 由外层共享，若在此落盘，
+    // 外层随后再 flush 会以「已被本次 repack 改写 offset 的 header + 旧 raw」重排，
+    // 全目录数据错位（package.json 头部被 styles 增量吃掉，正是 01:45 宿主崩溃的根因）。
     console.log(`[+] ${asar}\n    模型拉取补丁载荷漂移升级完成（自然序排序 + 确认去重 + 按钮一次性锁）${preFixed ? "；preload 注入形态已随内核换新" : ""}`);
     return true;
   }
@@ -1827,7 +1885,7 @@ function processModelhub(asar, checkOnly, revert, mem) {
   commit(".modelhub-tmp", (newSize) => writeJson(side, {
     asar_size: newSize,
     renderer_path: rendRel,
-    mode: mode === "v2" ? "v2.1" : mode === "v3" ? "v3.1" : mode,
+    mode: mode === "v2" ? "v2.1" : mode === "v3" ? "v3.1" : mode === "v4" ? "v4.1" : mode === "v5" ? "v5.1" : mode,
     files: originals.map(([rel, b]) => ({
       path: rel, size: b.length, original_b64: b.toString("base64"),
       ...(rel === rendRel && stickyAfter ? { sticky_after: stickyAfter } : {}),
@@ -1916,9 +1974,18 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   const scriptSrc = fs.existsSync(enhSrcPath) ? fs.readFileSync(enhSrcPath) : null;
   const mainIsCurrent = countBytes(mainBuf, handlers) === 1;
   const scriptIsCurrent = !!scriptCur0 && !!scriptSrc && scriptSrc.equals(scriptCur0);
+  // 布局顺序自检：enhance 块必须位于 modelhub 块之前（文件尾顺序 [clean][enhance][modelhub]）。
+  // 历史版本同批重打时 enhance strip+append 把 modelhub 甩到文件中部（import 落进函数体之后
+  // 区域）→ v8 编译期崩；此形态下载荷字节虽为最新，但直接 skip 会让宿主保持崩溃形态，
+  // 故检测到错序必须走剥旧重排自愈路径，绝不跳过。
+  const enhIm = Buffer.from('import{ipcMain as Zenh}from"electron";', "utf8");
+  const mhIm = Buffer.from('import{ipcMain as MdlH}from"electron";', "utf8");
+  const layoutBad =
+    countBytes(mainBuf, enhIm) === 1 && countBytes(mainBuf, mhIm) === 1
+    && mainBuf.indexOf(enhIm) > mainBuf.indexOf(mhIm);
 
   if (checkOnly) {
-    const st = tagged ? (isV2 ? (mainIsCurrent && scriptIsCurrent ? (preIsCurrent ? "已打" : "已打（preload 注入形态与内核不匹配，重跑 --enhance-btn 原地升级）")
+    const st = tagged ? (isV2 ? (mainIsCurrent && scriptIsCurrent ? (preIsCurrent ? (layoutBad ? "已打（main 尾块顺序异常，重跑 --enhance-btn 自愈）" : "已打") : "已打（preload 注入形态与内核不匹配，重跑 --enhance-btn 原地升级）")
                               : "已打（载荷/脚本有更新，重跑 --enhance-btn 原地升级）")
                               : "已打（旧版，重跑 --enhance-btn 原地升级）")
                       : (partial ? `不完整（${partial}/4）` : "未打");
@@ -1985,7 +2052,8 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   }
 
   // 打补丁 / 原地升级（旧版注入先剥离再按当前载荷重注入，partial 状态一并修复）
-  if (tagged && isV2 && mainIsCurrent && scriptIsCurrent && preIsCurrent) { console.log(`[=] ${asar}\n    已打增强按钮（载荷为最新），跳过`); return false; }
+  if (tagged && isV2 && mainIsCurrent && scriptIsCurrent && preIsCurrent && !layoutBad) { console.log(`[=] ${asar}\n    已打增强按钮（载荷为最新），跳过`); return false; }
+  if (layoutBad) console.log(`[*] ${asar}\n    main 尾块错序（增强块在 modelhub 之后，v8 编译期崩），剥旧重排自愈`);
   const bad = [];
   let pre2 = stripPreload(preBuf, bad);
   let main2 = mainBuf.includes(ENH_MARK_MAIN) ? stripMainBlock(mainBuf, bad) : mainBuf;
@@ -2005,8 +2073,20 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
 
   const head = anchor.subarray(0, anchor.length - Buffer.byteLength(tail));
   const preNew = replaceOnce(pre2, anchor, Buffer.concat([head, injCur, Buffer.from(tail)]));
-  const sep = main2.length && main2[main2.length - 1] === 0x0a ? Buffer.alloc(0) : Buffer.from("\n");
-  const mainNew = Buffer.concat([main2, sep, handlers]);
+  // main 追加位置：若此前 modelhub 已把 handler 块追加到文件末尾，enhance 必须插到
+  // modelhub 块之前（文件尾顺序模型 [clean][enhance][modelhub]）。否则同批重打时
+  // enhance 的 strip+append 会把 modelhub 块甩到文件中部 → import 落进函数体之后区域
+  // → v8 编译期 EXC_BREAKPOINT/SIGTRAP 崩溃（host 3.14.1 实机复现）。
+  const hbOrder = Buffer.from('import{ipcMain as MdlH}from"electron";', "utf8");
+  const mhAt = countBytes(main2, hbOrder) === 1 ? main2.indexOf(hbOrder) : -1;
+  let mainNew;
+  if (mhAt > 0) {
+    // 与既有存活布局保持一致：enhance 块紧跟 Mdlh 块之后（无换行分隔）
+    mainNew = Buffer.concat([main2.subarray(0, mhAt), handlers, main2.subarray(mhAt)]);
+  } else {
+    const sep = main2.length && main2[main2.length - 1] === 0x0a ? Buffer.alloc(0) : Buffer.from("\n");
+    mainNew = Buffer.concat([main2, sep, handlers]);
+  }
   let idxNew = idxBuf;
   if (!idxNew.includes(ENH_MARK_INDEX)) {
     if (countBytes(idxNew, Buffer.from("</body>")) !== 1) {
@@ -2080,9 +2160,9 @@ function revertMhRenderer(cur, ph, stickyAfterB64) {
 function processEditAll(target, checkOnly, revert) {
   const side = target + ".editall.json";
   const ph = loadMhPayload();
-  // 每项为变体列表：旧内核 y/m → v/f → 3.12.x A/w 形态（混淆名随版本漂移，结构不变），打时按内容命中选一。
+  // 每项为变体列表：旧内核 y/m → v/f → 3.12.x A/w → 3.14.x E/w（混淆名随版本漂移，结构不变），打时按内容命中选一。
   const variants = [
-    ["P1", [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2], [ph.P1_OLD_V3, ph.P1_NEW_V3]]],
+    ["P1", [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2], [ph.P1_OLD_V3, ph.P1_NEW_V3], [ph.P1_OLD_V4, ph.P1_NEW_V4]]],
     ["P2", [[ph.P2_OLD, ph.P2_NEW], [ph.P2_OLD_V2, ph.P2_NEW_V2]]],
   ].map(([lbl, list]) => [lbl, list.map(([o, n]) => [Buffer.from(o, "utf8"), Buffer.from(n, "utf8")])]);
 
@@ -2259,6 +2339,9 @@ function main() {
         try {
           // MemAsar 批量：一次打开、N 个补丁内存叠加、单次落盘（revert/apply 同一套路）
           const mem = memAsarOpen(a);
+          // 先做结构自愈：early double-flush 事故会让 package.json 条目错位，
+          // 这种包任何补丁流程都必须先修底座，否则重打包后依旧起不来。
+          mem.healPkgJson(opts.check);
           let touched = 0;
           for (const t of repackable) {
             if (t.run(a, opts.check, opts.revert, mem)) touched++;
