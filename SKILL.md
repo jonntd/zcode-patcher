@@ -1,13 +1,13 @@
 ---
 name: zcode-patcher
-description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁工具：①自定义模型供应商思考等级（effort/thinking/budget_tokens 真正下发到请求体）②用量页去截断（打开统计图：趋势图/饼图全量展示）③模型菜单加宽（供应商子菜单 192/160px→384px，长模型名完整显示）④继续按钮（工具栏一键填入「继续」并发送）⑤TPS 状态栏（打开状态栏：输入框工具栏统计胶囊，时间·首 token·tok/s·out）⑥模型拉取（打开模型拉取：渠道页拉取模型/自定义请求头/视觉探测/删除持久化）⑦全消息可编辑（打开编辑历史：解除只有最后一条用户消息可编辑的限制）⑧去额度广告（去额度骚扰横幅：关闭「今日免费计划额度剩余 x%，可升级」升级广告，保留耗尽/受限提示）。只有当用户明确要求执行本 skill、或明确点名「zcode-patcher」时才加载；用户只是泛泛提到思考等级、用量图、状态栏、模型拉取、编辑历史、补丁等话题时，一律不要自动触发本 skill。"
+description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁工具：①自定义模型供应商思考等级（effort/thinking/budget_tokens 真正下发到请求体）②用量页去截断（打开统计图：趋势图/饼图全量展示）③模型菜单加宽（供应商子菜单 192/160px→384px，长模型名完整显示）④继续按钮（工具栏一键填入「继续」并发送）⑤TPS 状态栏（打开状态栏：输入框工具栏统计胶囊，时间·首 token·tok/s·out）⑥模型拉取（打开模型拉取：渠道页拉取模型/自定义请求头/视觉探测/删除持久化）⑦全消息可编辑（打开编辑历史：解除只有最后一条用户消息可编辑的限制）⑧去额度广告（去额度骚扰横幅：关闭「今日免费计划额度剩余 x%，可升级」升级广告，保留耗尽/受限提示）⑨模型 3009 自动重试（把 Start Plan「model concurrency limit exceeded」业务码从不可重试翻为可重试，走内核通用指数退避）。只有当用户明确要求执行本 skill、或明确点名「zcode-patcher」时才加载；用户只是泛泛提到思考等级、用量图、状态栏、模型拉取、编辑历史、补丁等话题时，一律不要自动触发本 skill。"
 ---
 
 # ZCode 客户端补丁工具
 
 > 实现为零依赖 Node.js 脚本 `scripts/zcode-patcher.js`（旧 Python 实现已退役，存于 `scripts/legacy/` 仅供回退参考，勿与新功能混用）。
 
-三类补丁，均幂等、可检查、可还原、ZCode 升级后需重打：
+多项补丁，均幂等、可检查、可还原、ZCode 升级后需重打：
 
 | 能力 | 说法 | 命令 | 改哪里 |
 |---|---|---|---|
@@ -19,10 +19,11 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 | 打开状态栏 | 输入框工具栏 TPS 统计胶囊 | `node zcode-patcher.js --tps-footer [--check/--revert]` | app.asar（重打包级：注入脚本 + 挂载 index.html） |
 | 打开模型拉取 | 渠道页「拉取模型」/自定义请求头/视觉探测/删除持久化 | `node zcode-patcher.js --modelhub [--check/--revert]` | app.asar（重打包级：preload/main/renderer 三条目改写） |
 | 打开编辑历史 | 解除只有最后一条用户消息可编辑的限制 | `node zcode-patcher.js --edit-all [--check/--revert]` | 内核 zcode.cjs（两处可逆文本替换） |
+| 模型 3009 自动重试 | Start Plan 并发上限（`3009`）不再被 `retryable:false` 直接判死，进入通用指数退避 | `node zcode-patcher.js --model-retry [--check/--revert]` | 内核 zcode.cjs（业务码表 1 字节等长翻转） |
 | 增强提示词 | 输入框工具栏「✨ 增强」按钮：把草稿改写为结构化提示词（快捷键 `Ctrl+/`，Mac/Windows/Linux 通用；右键面板可指定模型/模式），原文可一键撤销 | `node zcode-patcher.js --enhance-btn [--check/--revert]` | app.asar（重打包级：preload IPC×2 + main handler×2 + index.html 挂 zcode-enhance.js） |
 | 去额度广告 | 关闭「今日免费计划额度剩余 x%，可升级」骚扰横幅，保留耗尽/受限提示 | `node zcode-patcher.js --quota-banner [--check/--revert]` | app.asar 内渲染文件（同长度原地改字节） |
 
-两个及以上功能可一次执行：`node zcode-patcher.js --usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner`。
+两个及以上功能可一次执行：`node zcode-patcher.js --usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner --edit-all --model-retry`。
 
 **推荐安装**（摆脱外置卷/长路径依赖）：把 `scripts/` 下五个文件（`zcode-patcher.js`、`modelhub_payload.json`、`zcode-tps.js`、`zcode-enhance.js`、`zcode-continue.js`）复制到 `~/.zcode/patcher/`，并使用同目录一键脚本 `zcode-patch`（已 alias 进 ~/.zshrc）：
 
@@ -32,9 +33,9 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 - Windows：五个文件复制到 `%USERPROFILE%\.zcode\patcher\`，一键脚本用仓库内 `scripts\zcode-patch.cmd`（子命令同上：无参 / `check` / `revert` / `-f`；需 Windows 10+，Program Files 安装需管理员终端，打补丁前完全退出 ZCode）
 - **运行检测（sh 版，勿改用 `pgrep -xq ZCode`）**：判据是 `ps -eo comm= | grep -qxE 'ZCode|zcode|.*/(ZCode|zcode)'`。实测 macOS + Electron 41 打包的 ZCode 3.11.x 上 `pgrep -x` **看不见** ZCode 主进程（同一时刻 `ps -eo comm=` 有 `ZCode` 行，`pgrep -x ZCode` 却返回 1），而 `lsappinfo` 只认已登记 bundle 的 App、对在跑的应用也可能返回空（实测 Finder 在跑时输出为空），都不能用来判断。判据要同时认短名与完整路径两种 `comm` 形态，并尾部锚定，才不会命中 `ZCode Helper` / `zcode-cli` / `ZCode Computer Use`。漏报的后果是：守卫误判「未运行」直接开打，asar 被原子替换但运行中的实例仍握着旧 inode（旧代码），收尾的 `open -a ZCode` 只把旧实例切到前台、不会重载 —— 用户以为生效了，实际跑的还是旧代码。
 
-**ZCode 升级后**：官方更新会覆盖 zcode.cjs 与 app.asar、五补丁全失效，跑一次 `zcode-patch -f` 即可；思考等级/TPS 备份检测到升级覆盖会自动刷新为新版原样（还原不降级）。
+**ZCode 升级后**：官方更新会覆盖 zcode.cjs 与 app.asar、全部补丁失效，跑一次 `zcode-patch -f` 即可；思考等级/TPS 备份检测到升级覆盖会自动刷新为新版原样（还原不降级）。
 
-五个补丁两两独立、幂等、可任意顺序打与还原（还原均为定点还原，互不踩踏；唯一例外见下方「还原顺序」）。
+各补丁两两独立、幂等、可任意顺序打与还原（还原均为定点还原，互不踩踏；唯一例外见下方「还原顺序」）。
 
 ## 标准执行流程（AI 代执行与人工自助通用）
 
@@ -64,7 +65,7 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 ## 还原顺序（唯一注意点）
 
 - app.asar 三补丁（统计图/状态栏/模型拉取）与内核 edit-all 的还原都是**定点还原**：只恢复本补丁改过的字节/条目，任意顺序、任意组合互不影响。
-- 内核思考等级补丁的还原是**整文件恢复 zcode.cjs.bak**：若 .bak 拍摄于 edit-all 打上之前，还原思考等级会连带抹掉 edit-all（`--edit-all --check` 可发现，重打即可）。约定**先 `--edit-all --revert` 再还原思考等级**，或打补丁时先 edit-all 后思考等级（此时 .bak 已含 edit-all，顺序无所谓）。
+- 内核思考等级补丁的还原是**整文件恢复 zcode.cjs.bak**：若 .bak 拍摄于 edit-all / model-retry 打上之前，还原思考等级会连带抹掉它们（`--edit-all --check` / `--model-retry --check` 可发现，重打即可）。约定**先还原 edit-all / model-retry 再还原思考等级**，或打补丁时先打这两项后打思考等级（此时 .bak 已含它们，顺序无所谓）。
 - 上游独立版 zcode-modelhub-patch（`一键安装补丁.cmd`，整包备份 app.asar.modelhub-backup）与本融合版不可混用：装过 .cmd 版的先跑上游「还原补丁.cmd」，再用本工具管理。
 
 ## 跨平台约定
@@ -95,6 +96,7 @@ node zcode-patcher.js --modelhub --check
 node zcode-patcher.js --enhance-btn --check
 node zcode-patcher.js --quota-banner --check
 node zcode-patcher.js --edit-all --check
+node zcode-patcher.js --model-retry --check
 ```
 
 失配的按「自助使用流程」重打；思考等级补丁在新内核上先 `--extract` 确认锚点可提取。
@@ -334,7 +336,8 @@ node zcode-patcher.js --modelhub --revert   # 定点还原
 ### 与上游实现的差异（本融合版改进点）
 
 - **renderer 文件按内容锚点定位**：上游硬编码带哈希的文件名（如 `styles-DyAcaLKy.js`），构建哈希一变即失效；本版优先固定名、失配时按「添加按钮」内容锚点全量扫描回退（期望唯一命中）。
-- **定点还原**：上游整包备份/整包还原（会连带抹掉其它补丁）；本版 sidecar `app.asar.modelhub-patch.json` 只记录 preload/main/renderer 三个条目的原始字节（base64 + asar 尺寸指纹），还原时按路径定点写回，统计图/状态栏补丁不受影响。
+- **渲染组件锚点按变体组管理**：模型列表组件的符号名与函数体随 ZCode 构建漂移（v2 `vRt` / v3 `mbn` / v4 `_bn` / v5 `txn` / v6 `rxn` / v7 `hUn`），每代单列一组锚点（`RENDER_V{n}_ANCHOR` + `SIG_OLD/NEW` + `INSERT`），扫描时要求**恰一版命中**才动手；注入块与头部按钮系（`RENDER_V2_HDR_*`）跨变体共享。锚点漂移时**新增变体组**，绝不改写旧组——多版本安装共存靠这个。
+- **定点还原**：上游整包备份/整包还原（会连带抹掉其它补丁）；本版 sidecar `app.asar.modelhub-patch.json` 只记录 preload/main/renderer 三个条目的原始字节（base64 + asar 尺寸指纹），还原时按路径定点写回，统计图/状态栏补丁不受影响。还原按三点注入逐变体尝试剥离（签名/传参/头部按钮），变体与打补丁时不一致也能还原，最后才走 sidecar 字节兜底。
 - **integrity 完整**：上游重打包会删掉改动条目的 integrity；本版复用 `_repack_asar` 重算全部改动条目 integrity，重打包后自动同步 chart/tps sidecar。
 - 载荷字符串逐字取自上游（`scripts/modelhub_payload.json`，含出处注释）；上游的 Windows `.cmd` 入口/强杀进程/注册表探测不再使用——统一走本脚本的跨平台探测，ZCode 需手动完全退出。
 - 上游锚点与 ZCode 版本强耦合（符号名随构建变化），失配时明确报错放弃、不会损坏文件；等上游仓库更新载荷后替换 `modelhub_payload.json` 即可。
@@ -377,6 +380,17 @@ node zcode-patcher.js --modelhub --revert   # 定点还原
 - **等长原地覆盖**：asar 头/offset/integrity 零改动，与统计图/菜单加宽同类；状态记录 `app.asar.quota-patch.json`（仅记 asar_size 指纹与描述），还原 = 反向字节替换（内容锚点，不依赖 sidecar），其它补丁重排 asar 后照常可查可还原。
 - **验证**：`--quota-banner --check` 三点全「已打」后重启 ZCode，把免费模型用到 50% 以下——不再出现「额度剩余 x%，可升级」横幅；把额度用到 0% 或触发系统繁忙，横幅仍正常出现。
 - **失配处理**：`--check` 报「锚点命中 N 个文件」或「计数异常」说明未来版本重构了阈值函数，按新代码重新分析补丁点，勿盲目替换。内核 zcode.cjs 无此横幅（startPlan 字样仅为供应商 ID/限流上下文），终端 CLI 不受影响也不需要打。
+
+## 六点六、模型 3009 自动重试（--model-retry）
+
+针对 Start Plan 后端返回的业务码 `3009`（`model concurrency limit exceeded`）。内核业务码表把 3008/3009/3010 统一映射为 `ModelRateLimited` 且 `retryable:false`，因此**通用重试通道直接跳过**（日志 `model.retry.delay.resolved` 里 `canRetry:false`、`attempt:1/maxAttempts:11`）；仅剩 Start Plan 专用准入重试 `[1s,2s]`，且要求 `turnNumber>0`（会话第一条消息连这两次也没有）。耗尽后抛 `StartPlanBusyAutoRetryExhaustedError`，UI 显示「当前系统繁忙，请切换模型、升级账户，或稍后再试」。
+
+- **补丁点**：内核 `zcode.cjs` 的 3009 表项 `["3009",{code:as.ModelRateLimited,reason:bs.RateLimited,retryReason:tl.RateLimited,retryable:!1}]` → `retryable:!0`。等长（97 字节）原地改，锚点按结构正则匹配、唯一命中才动手；`--revert` 反向等长替换，不产生备份/sidecar。
+- **生效后的行为**：3009 进入内核通用重试（默认 `maxAttempts:11` = 10 次重试，2s 起、×2、jitter 0.5~1.0、上限 60s、优先尊重 Retry-After），首轮消息也重试；外层 Start Plan `[1s,2s]` 两轮仍保留兜底。
+- **调参（可选）**：`ZCODE_MODEL_RETRY_MAX_RETRIES`（值 N = 最多尝试 N+1 次）、`ZCODE_MODEL_RETRY_BASE_DELAY_MS`、`ZCODE_MODEL_RETRY_BACKOFF_FACTOR`、`ZCODE_MODEL_RETRY_MAX_DELAY_MS`；macOS GUI 需 `launchctl setenv` 后重启 ZCode 才继承。
+- **验证**：`--model-retry --check` 显示「已打」→ 重启 ZCode → 再次遇到并发上限时看 `~/.zcode/cli/log/zcode-<date>.jsonl`：该 request 应出现 `model.retry.scheduled`（reason `rate_limited`）与 `model.retry.delay.resolved` 的 `canRetry:true`，而不是立即 `turn.failed`。
+- **代价/边界**：只延后失败时间、不保证成功；默认配置下最坏可等数分钟（每轮 10 次指数退避 × Start Plan 3 轮），介意可用环境变量收紧。仅针对 3009；3008/3010 与配额真正耗尽类业务码保持原样。
+- **失配处理**：`--check` 报「本补丁在该内核不适用」说明未来内核改了表项字段顺序/结构，按新代码重新定位（必要时给锚点加变体），勿盲目替换。
 
 ## 七、自定义模型接入指南（纯配置层起步，从零到可用）
 

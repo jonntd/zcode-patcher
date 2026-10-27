@@ -34,6 +34,7 @@ const targetArg = process.argv.slice(2).find((a) => !a.startsWith("--")) || "";
 const PATCHES = [
   { name: "思考等级透传",   flag: "" },               // 默认(内核)
   { name: "全消息可编辑",   flag: "--edit-all" },
+  { name: "模型 3009 重试", flag: "--model-retry" },
   { name: "用量页去截断",   flag: "--usage-chart" },
   { name: "模型菜单加宽",   flag: "--menu-width" },
   { name: "继续按钮",       flag: "--continue-btn" },
@@ -132,10 +133,10 @@ async function executePatch(row, revert) {
   return { ok: row.state !== "partial" && row.state !== "unknown", checked: true };
 }
 
-/** 由 --check 输出推导状态：'applied' | 'partial' | 'not' | 'unknown'。 */
+/** 由 --check 输出推导状态：'applied' | 'partial' | 'not' | 'na' | 'unknown'。 */
 function classify(out) {
   const text = out || "";
-  if (text.includes("暂不支持")) return "na";   // 锚点体系明确判定的「不适用」，与「未打」区分开
+  if (text.includes("本补丁在该内核不适用")) return "na";   // 锚点体系明确判定的「不适用」，与「未打」区分开
   if (text.includes("部分") || text.includes("异常") || text.includes("不完整")) return "partial";
   if (text.includes("已打")) return "applied";
   if (text.includes("未打") || text.includes("已还原") || text.includes("没有备份")) return "not";
@@ -166,7 +167,7 @@ function showOverview(rows) {
   });
 }
 
-// 菜单条目顺序：全部打我（第一项）→ 9 个补丁 → 全部还原（末项）。
+// 菜单条目顺序：全部打我（第一项）→ 10 个补丁 → 全部还原（末项）。
 // 每项统一为 { kind: "batch"|"patch", ... }，索引即光标位置。
 function menuItems(rows) {
   return [{ kind: "batch", batch: BATCH_APPLY }, ...rows.map((r) => ({ kind: "patch", row: r })), { kind: "batch", batch: BATCH_REVERT }];
@@ -194,7 +195,7 @@ function render(rows, sel, busyIdx) {
   clearScreen();
   const out = [];
   out.push(color("ZCode 客户端补丁工具 — 交互式菜单", Ansi.BOLD));
-  out.push(color("方向键 ↑↓ 移动 · Enter 执行 · 1-9 快选补丁 · / 总览 · q 退出", Ansi.GREY));
+  out.push(color("方向键 ↑↓ 移动 · Enter 执行 · 1-9/0 快选补丁 · / 总览 · q 退出", Ansi.GREY));
   out.push("");
   const items = menuItems(rows);
   items.forEach((it, i) => {
@@ -325,7 +326,8 @@ async function main() {
     }
 
     const n = parseInt(ch, 10);
-    if (!Number.isNaN(n) && n >= 1 && n <= rows.length) { sel = n; render(rows, sel, busyIdx); return; } // 数字对应补丁（前面隔着「全部打我」，故 +1）
+    const quick = n === 0 ? rows.length : n;   // 0 代表第 10 个补丁（补丁数超过 9 时仍可键盘直达）
+    if (!Number.isNaN(n) && quick >= 1 && quick <= rows.length) { sel = quick; render(rows, sel, busyIdx); return; } // 数字对应补丁（前面隔着「全部打我」，故 +1）
 
     // Enter 执行当前项（批量行 或 补丁行）
     if (key && (key.name === "return" || key.name === "enter" || ch === "\r" || ch === "\n" || ch === "h")) {

@@ -8,6 +8,7 @@
 const assert = require("assert");
 const { spawnSync } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -58,6 +59,7 @@ test("所有 JS 脚本语法可解析", () => {
 test("--help 打印用法", () => {
   const r = run(CLI, ["--help"]);
   assert.ok(/用法/.test(r.stdout), "help 输出缺少用法");
+  assert.ok(r.stdout.includes("--model-retry"), "help 输出缺少 --model-retry");
   assert.strictEqual(r.status, 0);
 });
 
@@ -67,11 +69,12 @@ test("--check 在无 ZCode 时不报错崩溃", () => {
 });
 
 // --- 非交互状态（只读） ---
-test("--status --json 输出合法 JSON，含 9 个补丁", () => {
+test("--status --json 输出合法 JSON，含 10 个补丁", () => {
   const r = run(TUI, ["/tmp/zcode-patcher-nonexistent", "--status", "--json"]);
   const data = JSON.parse(r.stdout);
   assert.ok(Array.isArray(data), "不是数组");
-  assert.strictEqual(data.length, 9, "补丁数不是 9");
+  assert.strictEqual(data.length, 10, "补丁数不是 10");
+  assert.ok(data.some((row) => row.flag === "--model-retry" && row.name.includes("3009")), "缺少模型 3009 重试补丁");
   for (const row of data) {
     assert.ok(typeof row.name === "string" && row.name, "缺 name");
     assert.ok(["applied", "partial", "not", "unknown"].includes(row.state), "非法 state: " + row.state);
@@ -127,23 +130,126 @@ test("拉取模型：自然序排序、确认去重与载荷漂移升级", () =>
   assert.ok(patcher.includes("边界标记剥旧重注"), "漂移升级未按边界标记剥离");
 });
 
-test("preload 注入随内核形态选变体（3.14+ 绑定名 h→_）", () => {
+test("preload 注入随内核形态选变体（h→_→S）", () => {
   const ph = JSON.parse(fs.readFileSync(path.join(ROOT, "scripts/modelhub_payload.json"), "utf8"));
   assert.ok(ph.PRELOAD_V2_WITNESS && ph.PRELOAD_V2_WITNESS.includes("connectRemote:s((t,n,i)=>_.ipcRenderer.invoke"),
     "见证串必须锚定 3.14+ 原生 connectRemote 体");
-  for (const [curKey, oldKey] of [["PRELOAD_INJECT_V2", "PRELOAD_INJECT"], ["ENH_PRELOAD_INJECT_V3", "ENH_PRELOAD_INJECT"]]) {
+  assert.ok(ph.PRELOAD_V3_WITNESS && ph.PRELOAD_V3_WITNESS.includes("connectRemote:s((t,n,i)=>S.ipcRenderer.invoke"),
+    "见证串必须锚定 3.16+ 原生 connectRemote 体");
+  for (const [curKey, oldKey] of [["PRELOAD_INJECT_V2", "PRELOAD_INJECT"], ["PRELOAD_INJECT_V3", "PRELOAD_INJECT_V2"], ["ENH_PRELOAD_INJECT_V3", "ENH_PRELOAD_INJECT"]]) {
     assert.ok(ph[curKey], "缺少 " + curKey + " 变体");
-    assert.ok(ph[curKey].includes("_.ipcRenderer.invoke"), curKey + " 未绑定 _.ipcRenderer");
-    // 变体除绑定名外必须与旧形态逐字符一致（h. 与 _. 等长），替换语义不变
+    assert.ok(ph[curKey].includes(".ipcRenderer.invoke"), curKey + " 未绑定 ipcRenderer");
+    // 变体除绑定名外必须与旧形态逐字符一致（h. 与 _. / S. 等长），替换语义不变
+    const norm = (s) => s.split("_.ipcRenderer").join("h.ipcRenderer").replace(/S\.ipcRenderer/g, "h.ipcRenderer");
     assert.ok(ph[curKey].length === ph[oldKey].length, curKey + " 与旧形态长度不一致");
-    assert.ok(ph[curKey].split("_.ipcRenderer").join("h.ipcRenderer") === ph[oldKey],
-      curKey + " 与旧形态除绑定名外存在漂移");
+    assert.ok(norm(ph[curKey]) === norm(ph[oldKey]), curKey + " 与旧形态除绑定名外存在漂移");
   }
   const patcher = fs.readFileSync(CLI, "utf8");
-  assert.ok(patcher.includes("preWantsV2"), "modelhub 未按内核形态选择注入变体");
+  assert.ok(patcher.includes("preFormCur"), "modelhub 未按内核形态选择注入变体");
   assert.ok(patcher.includes("preIsCurrent"), "enhance 未按内核形态选择注入变体");
   assert.ok(patcher.includes("preload 注入形态与内核不匹配"), "--check 未暴露形态不匹配");
-  assert.ok(patcher.includes("[injectV3, injectNew, injectOld]"), "enhance 剥离未覆盖全部注入形态");
+  assert.ok(patcher.includes("[injectV4, injectV3, injectNew, injectOld]"), "enhance 剥离未覆盖全部注入形态");
+});
+
+test("模型 3009 重试：只翻转 3009，等长、幂等、可还原", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-retry-"));
+  const target = path.join(dir, "zcode.cjs");
+  const entry = (code) => `["${code}",{code:as.ModelRateLimited,reason:bs.RateLimited,retryReason:tl.RateLimited,retryable:!1}]`;
+  const original = [
+    'const as={ModelRateLimited:"model_rate_limited"},bs={RateLimited:"rate_limited"},tl={RateLimited:"rate_limited"};',
+    `const table=[${entry("3009")},${entry("3008")},${entry("3010")}];`,
+    "module.exports=table;",
+  ].join("\n");
+  fs.writeFileSync(target, original);
+
+  const applied = run(CLI, ["--model-retry", target]);
+  assert.strictEqual(applied.status, 0, applied.stderr || applied.stdout);
+  const after = fs.readFileSync(target, "utf8");
+  assert.ok(after.includes(entry("3009").replace("retryable:!1", "retryable:!0")), "3009 未翻转为可重试");
+  assert.ok(after.includes(entry("3008")), "3008 被误改");
+  assert.ok(after.includes(entry("3010")), "3010 被误改");
+  assert.strictEqual(after.length, original.length, "补丁改变了内核长度（应等长）");
+
+  const checked = run(CLI, ["--model-retry", "--check", target]);
+  assert.ok(/3009 自动重试: 已打/.test(checked.stdout), "--check 未报告已打");
+
+  const again = run(CLI, ["--model-retry", target]);
+  assert.ok(/已打，跳过/.test(again.stdout), "重复打未走幂等跳过");
+  assert.strictEqual(fs.readFileSync(target, "utf8"), after, "重复打改变了文件");
+
+  const reverted = run(CLI, ["--model-retry", "--revert", target]);
+  assert.strictEqual(reverted.status, 0, reverted.stderr || reverted.stdout);
+  assert.strictEqual(fs.readFileSync(target, "utf8"), original, "还原后与原始内容不一致");
+  assert.ok(!fs.existsSync(target + ".modelretry-tmp.cjs"), "残留 node --check 临时文件");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("模型 3009 重试：锚点容忍压缩变量名漂移，缺失时报告不适用", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-retry-drift-"));
+  const target = path.join(dir, "zcode.cjs");
+  fs.writeFileSync(target, 'const zz={ModelRateLimited:"model_rate_limited"},yy={RateLimited:"rate_limited"},xx={RateLimited:"rate_limited"};module.exports=[["3009",{code:zz.ModelRateLimited,reason:yy.RateLimited,retryReason:xx.RateLimited,retryable:!1}]];');
+  const r = run(CLI, ["--model-retry", target]);
+  assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+  assert.ok(fs.readFileSync(target, "utf8").includes("retryable:!0}]];"), "变量名漂移时未命中锚点");
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-retry-na-"));
+  const none = path.join(dir2, "zcode.cjs");
+  fs.writeFileSync(none, "module.exports={};");
+  const na = run(CLI, ["--model-retry", "--check", none]);
+  assert.ok(/本补丁在该内核不适用/.test(na.stdout), "缺失锚点未报告不适用");
+  fs.rmSync(dir2, { recursive: true, force: true });
+});
+
+test("全消息可编辑：结构化锚点容忍未知变量名漂移，幂等、可还原", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-editall-struct-"));
+  const target = path.join(dir, "zcode.cjs");
+  // 用未来版本才会出现的变量名（不在任何字面变体里），验证结构化兜底
+  const k = "QQz", r = "WWr", c = "EEc", t = "TTt", n = "NNn";
+  const p1Old = `else if(${k}.kind==="userInput")${k}.rowId===${r}?(${c}.canEdit=!0,${c}.editDisposition="rewind"):(delete ${c}.canEdit,delete ${c}.editDisposition)`;
+  const p1New = `else if(${k}.kind==="userInput")this.entityIdByRowId.get(${k}.rowId)&&this.editTargetByEntityId.has(this.entityIdByRowId.get(${k}.rowId))&&this.messageIdByRowId.has(${k}.rowId)?(${c}.canEdit=!0,${c}.editDisposition="rewind"):(delete ${c}.canEdit,delete ${c}.editDisposition)`;
+  const p2Old = `resolveEditTargetByEntityId(${t}){if(${t}!==this.currentEditableEntityId)return null;let ${n}=this.editTargetByEntityId.get(${t});`;
+  const p2New = `resolveEditTargetByEntityId(${t}){let ${n}=this.editTargetByEntityId.get(${t});`;
+  // 语法合法的宿主:P2 是类方法体（p2Old 本身含方法签名,放进 class 体）;
+  // P1 按真实内核形态嵌入——else if 分支体是三元表达式语句,以 `;else` 收尾链到
+  // 下一分支（压缩器产物;node 视三元为表达式语句,分号后接 else 合法）
+  const original = `class X{${p2Old}return null}}\nfunction f(){if(0){a()}${p1Old};else{b()}}\nmodule.exports={f};`;
+  fs.writeFileSync(target, original);
+
+  const applied = run(CLI, ["--edit-all", target]);
+  assert.strictEqual(applied.status, 0, applied.stderr || applied.stdout);
+  assert.ok(/结构化锚点/.test(applied.stdout), "未走结构化兜底路径");
+  const after = fs.readFileSync(target, "utf8");
+  assert.ok(after.includes(p1New), "P1 未按捕获变量生成替换串");
+  assert.ok(after.includes(p2New), "P2 未按捕获变量生成替换串");
+
+  const checked = run(CLI, ["--edit-all", "--check", target]);
+  assert.ok(/全消息可编辑: 已打/.test(checked.stdout), "--check 未识别结构化形态为已打");
+
+  const again = run(CLI, ["--edit-all", target]);
+  assert.ok(/已打，跳过/.test(again.stdout), "重复打未走幂等跳过");
+
+  const reverted = run(CLI, ["--edit-all", "--revert", target]);
+  assert.strictEqual(reverted.status, 0, reverted.stderr || reverted.stdout);
+  assert.strictEqual(fs.readFileSync(target, "utf8"), original, "还原后与原始内容不一致");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("全消息可编辑：字面与结构均失配时拒绝盲改", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-editall-na-"));
+  const target = path.join(dir, "zcode.cjs");
+  fs.writeFileSync(target, "module.exports={};");
+  const r = run(CLI, ["--edit-all", target]);
+  assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+  assert.ok(/拒绝盲改/.test(r.stdout), "结构失配未拒绝盲改");
+  assert.strictEqual(fs.readFileSync(target, "utf8"), "module.exports={};", "拒绝后文件被改动");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("TUI 10 项补丁时按 0 可快选第 10 项", () => {
+  const tui = fs.readFileSync(TUI, "utf8");
+  assert.ok(tui.includes("const quick = n === 0 ? rows.length : n;"), "缺少 0 键映射到第 10 项");
+  assert.ok(tui.includes("1-9/0 快选补丁"), "菜单提示未说明 0 键");
 });
 
 test("引擎批量落盘与状态登记", () => {

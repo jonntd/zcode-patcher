@@ -4,7 +4,7 @@
  * ZCode 客户端补丁工具（零依赖 Node 版）
  * =====================================
  *
- * 对本地 ZCode 安装打五类补丁（均自动探测安装位置、幂等、可定点还原）。
+ * 对本地 ZCode 安装打各类补丁（均自动探测安装位置、幂等、可定点还原）。
  * 本文件是 zcode_patcher.py 的完整等价重写（Python 版已退役）；
  * 锚点替换全部在字节（Buffer）层面进行，规避文本模式的编码往返风险。
  *
@@ -45,7 +45,16 @@
  *   解除「只有最后一条用户消息能编辑」的限制。独立 sidecar zcode.cjs.editall.json，
  *   还原走文本反向替换而非整文件备份，与思考等级补丁（不同函数区域）互不干扰。
  *
- * 六、去额度骚扰横幅（app.asar，--quota-banner）
+ * 六点五、模型 3009 自动重试（内核 zcode.cjs，--model-retry）
+ *   3009 = Start Plan「model concurrency limit exceeded」。内核业务码表把它
+ *   硬编码为 retryable:false，通用重试通道（默认 11 次指数退避，尊重 Retry-After）
+ *   会直接跳过，只剩 Start Plan 专用准入重试 [1s,2s]（且首轮消息不生效）。
+ *   补丁把该表项的 retryable 翻成 true（等长 !1→!0，仅 1 字节语义变化），
+ *   让 3009 回到通用重试；3008/3010 与其它业务码保持原样。
+ *   锚点按结构匹配（code/reason/retryReason 枚举变量名随版本漂移），唯一命中才改，
+ *   还原为反向等长替换，不生成备份/sidecar。
+ *
+ * 七、去额度骚扰横幅（app.asar，--quota-banner）
  *   关闭「{model} 今日免费计划额度剩余 x%，可升级获得更稳定额度」升级广告横幅。
  *   原理：渲染层阈值函数按剩余比例产出横幅类型——≤50%/≤20%/≤10% 分别是
  *   half-used/low/very-low 三个广告档（额度还剩一半就开始催升级）；
@@ -63,6 +72,7 @@
  *   node zcode-patcher.js --tps-footer          # TPS 统计栏注入（同样支持 --check/--revert）
  *   node zcode-patcher.js --modelhub            # 模型拉取补丁（同样支持 --check/--revert）
  *   node zcode-patcher.js --edit-all            # 全消息可编辑（同样支持 --check/--revert）
+ *   node zcode-patcher.js --model-retry         # 模型 3009 自动重试（同样支持 --check/--revert）
  *   node zcode-patcher.js "D:\\ZCode"           # 只处理指定安装（安装根目录/.app/zcode.cjs 均可）
  *
  * 注意：ZCode 升级会覆盖 zcode.cjs 与 app.asar，升级后需重新执行对应补丁；
@@ -911,6 +921,13 @@ const MENU_WIDTH_VARIANTS = [
       { pattern: Buffer.from("`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), replacement: Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), desc: "自定义渠道子菜单 w-40(160px)→w-96(384px)，保留视口钳制" },
     ],
   },
+  {
+    label: "v3（官方自适应 w-max，默认宽变量 N）",
+    patches: [
+      { pattern: Buffer.from("N??`w-max min-w-[min(12rem,var(--radix-dropdown-menu-content-available-width))] max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), native: true, desc: "子菜单默认宽：官方已原生自适应（w-max），无需改写" },
+      { pattern: Buffer.from("`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), replacement: Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"), desc: "自定义渠道子菜单 w-40(160px)→w-96(384px)，保留视口钳制" },
+    ],
+  },
 ];
 for (const v of MENU_WIDTH_VARIANTS) {
   for (const it of v.patches) {
@@ -1490,6 +1507,14 @@ function processModelhub(asar, checkOnly, revert, mem) {
   const v5SigOld = ph.RENDER_V5_SIG_OLD ? Buffer.from(ph.RENDER_V5_SIG_OLD, "utf8") : null;
   const v5SigNew = ph.RENDER_V5_SIG_NEW ? Buffer.from(ph.RENDER_V5_SIG_NEW, "utf8") : null;
   const v5PropBuf = ph.RENDER_V5_INSERT ? Buffer.from(ph.RENDER_V5_INSERT, "utf8") : null;
+  const v6Buf = ph.RENDER_V6_ANCHOR ? Buffer.from(ph.RENDER_V6_ANCHOR, "utf8") : null;
+  const v6SigOld = ph.RENDER_V6_SIG_OLD ? Buffer.from(ph.RENDER_V6_SIG_OLD, "utf8") : null;
+  const v6SigNew = ph.RENDER_V6_SIG_NEW ? Buffer.from(ph.RENDER_V6_SIG_NEW, "utf8") : null;
+  const v6PropBuf = ph.RENDER_V6_INSERT ? Buffer.from(ph.RENDER_V6_INSERT, "utf8") : null;
+  const v7Buf = ph.RENDER_V7_ANCHOR ? Buffer.from(ph.RENDER_V7_ANCHOR, "utf8") : null;
+  const v7SigOld = ph.RENDER_V7_SIG_OLD ? Buffer.from(ph.RENDER_V7_SIG_OLD, "utf8") : null;
+  const v7SigNew = ph.RENDER_V7_SIG_NEW ? Buffer.from(ph.RENDER_V7_SIG_NEW, "utf8") : null;
+  const v7PropBuf = ph.RENDER_V7_INSERT ? Buffer.from(ph.RENDER_V7_INSERT, "utf8") : null;
   const v2HdrAnchor = ph.RENDER_V2_HDR_ANCHOR ? Buffer.from(ph.RENDER_V2_HDR_ANCHOR, "utf8") : null;
   const v2HdrInsert = ph.RENDER_V2_HDR_INSERT ? Buffer.from(ph.RENDER_V2_HDR_INSERT, "utf8") : null;
   // 旧版 v2（独立行按钮）整块注入串：仅为已打旧版的原地升级/还原保留
@@ -1519,38 +1544,53 @@ function processModelhub(asar, checkOnly, revert, mem) {
     if (!chunk.includes(v2BtnMark) || !chunk.includes(MH_MARK_RENDER)) return null;
     return Buffer.concat([buf.subarray(0, afterHdr), buf.subarray(addIdx)]);
   };
+  // v2..vN 变体组：各代仅模型列表组件符号名/帮助函数名不同，注入块与 HDR 系共享；
+  // 锚点漂移时在 payload 加 RENDER_V{n+1}_* 并在此登记一组，绝不改写旧组（多版本共存）。
+  const gens = [
+    { n: 2, buf: v2Buf, sigOld: v2SigOld, sigNew: v2SigNew, prop: v2PropBuf },
+    { n: 3, buf: v3Buf, sigOld: v3SigOld, sigNew: v3SigNew, prop: v3PropBuf },
+    { n: 4, buf: v4Buf, sigOld: v4SigOld, sigNew: v4SigNew, prop: v4PropBuf },
+    { n: 5, buf: v5Buf, sigOld: v5SigOld, sigNew: v5SigNew, prop: v5PropBuf },
+    { n: 6, buf: v6Buf, sigOld: v6SigOld, sigNew: v6SigNew, prop: v6PropBuf },
+    { n: 7, buf: v7Buf, sigOld: v7SigOld, sigNew: v7SigNew, prop: v7PropBuf },
+  ];
   const found = [];
   mem.each((p, ent) => {
     if (!p.startsWith("out/renderer/assets/") || !p.endsWith(".js") || ent.size < 100000) return;
     const b = mem.get(p);
-    const isV1 = v1Bufs.some((x) => b.includes(x));
-    const isV2 = b.includes(v2Buf);
-    const isV3 = v3Buf && b.includes(v3Buf);
-    const isV4 = v4Buf && b.includes(v4Buf);
-    const isV5 = v5Buf && b.includes(v5Buf);
-    if (isV1 || isV2 || isV3 || isV4 || isV5) found.push({ path: p, isV1, isV2, isV3, isV4, isV5 });
+    const rec = { path: p, isV1: v1Bufs.some((x) => b.includes(x)) };
+    for (const g of gens) rec[`isV${g.n}`] = !!(g.buf && b.includes(g.buf));
+    if (rec.isV1 || gens.some((g) => rec[`isV${g.n}`])) found.push(rec);
   });
   const v1hits = found.filter((f) => f.isV1);
-  const v2hits = found.filter((f) => f.isV2);
-  const v3hits = found.filter((f) => f.isV3);
-  const v4hits = found.filter((f) => f.isV4);
-  const v5hits = found.filter((f) => f.isV5);
+  const hitCount = (n) => found.filter((f) => f[`isV${n}`]).length;
   let mode = null;
   let rendRel = null;
-  if (v1hits.length === 1 && v2hits.length === 0 && v3hits.length === 0 && v4hits.length === 0 && v5hits.length === 0) { mode = "v1"; rendRel = v1hits[0].path; }
-  else if (v2hits.length === 1 && v1hits.length === 0 && v3hits.length === 0 && v4hits.length === 0 && v5hits.length === 0) { mode = "v2"; rendRel = v2hits[0].path; }
-  else if (v3hits.length === 1 && v1hits.length === 0 && v2hits.length === 0 && v4hits.length === 0 && v5hits.length === 0) { mode = "v3"; rendRel = v3hits[0].path; }
-  else if (v4hits.length === 1 && v1hits.length === 0 && v2hits.length === 0 && v3hits.length === 0 && v5hits.length === 0) { mode = "v4"; rendRel = v4hits[0].path; }
-  else if (v5hits.length === 1 && v1hits.length === 0 && v2hits.length === 0 && v3hits.length === 0 && v4hits.length === 0) { mode = "v5"; rendRel = v5hits[0].path; }
-  else {
-    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} v2=${v2hits.length} v3=${v3hits.length} v4=${v4hits.length} v5=${v5hits.length} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
+  for (const g of gens) {
+    if (hitCount(g.n) === 1 && v1hits.length === 0 && gens.every((o) => o.n === g.n || hitCount(o.n) === 0)) {
+      mode = `v${g.n}`;
+      rendRel = found.find((f) => f[`isV${g.n}`]).path;
+      break;
+    }
+  }
+  if (!mode && v1hits.length === 1 && gens.every((g) => hitCount(g.n) === 0)) { mode = "v1"; rendRel = v1hits[0].path; }
+  else if (!mode) {
+    console.log(`[!] ${asar}\n    模型拉取锚点命中 v1=${v1hits.length} ${gens.map((g) => `v${g.n}=${hitCount(g.n)}`).join(" ")} 个文件（期望恰一版=1），版本结构可能已变，跳过`);
     return false;
   }
-  // 当前生效字节集：v5 与 v4/v3/v2 仅组件符号名不同，注入块/HDR 系共享（payload V5/V4/V3 字段缺省时逐级回落以兼容旧载荷）
-  const sigOldBuf = mode === "v5" ? (v5SigOld || v4SigOld || v3SigOld || v2SigOld) : mode === "v4" ? (v4SigOld || v3SigOld || v2SigOld) : mode === "v3" ? (v3SigOld || v2SigOld) : v2SigOld;
-  const sigNewBuf = mode === "v5" ? (v5SigNew || v4SigNew || v3SigNew || v2SigNew) : mode === "v4" ? (v4SigNew || v3SigNew || v2SigNew) : mode === "v3" ? (v3SigNew || v2SigNew) : v2SigNew;
-  const callAnchorBuf = mode === "v5" ? (v5Buf || v4Buf || v3Buf || v2Buf) : mode === "v4" ? (v4Buf || v3Buf || v2Buf) : mode === "v3" ? (v3Buf || v2Buf) : v2Buf;
-  const propBuf = mode === "v5" ? (v5PropBuf || v4PropBuf || v3PropBuf || v2PropBuf) : mode === "v4" ? (v4PropBuf || v3PropBuf || v2PropBuf) : mode === "v3" ? (v3PropBuf || v2PropBuf) : v2PropBuf;
+  // 当前生效字节集：各代仅组件符号名不同，注入块/HDR 系共享（payload 高代字段缺省时逐级回落以兼容旧载荷）
+  const activeGen = mode === "v1" ? null : gens.find((g) => `v${g.n}` === mode);
+  const chainGet = (get) => {
+    for (let i = gens.indexOf(activeGen); i >= 0; i--) {
+      const v = get(gens[i]);
+      if (v) return v;
+    }
+    return null;
+  };
+  const sigOldBuf = mode === "v1" ? v2SigOld : chainGet((g) => g.sigOld);
+  const sigNewBuf = mode === "v1" ? v2SigNew : chainGet((g) => g.sigNew);
+  const callAnchorBuf = mode === "v1" ? v2Buf : chainGet((g) => g.buf);
+  const propBuf = mode === "v1" ? v2PropBuf : chainGet((g) => g.prop);
   if (!mem.has(MH_PRELOAD_REL) || !mem.has(MH_MAIN_REL)) {
     console.log(`[!] ${asar}\n    缺少 preload/main 条目，版本结构可能已变，跳过`);
     return false;
@@ -1564,16 +1604,20 @@ function processModelhub(asar, checkOnly, revert, mem) {
   const tagged = marks.filter(([rel, mark]) => mem.get(rel).includes(mark)).length;
 
   // preload 注入变体：原生 connectRemote 体的 ipcRenderer 绑定名随内核构建漂移
-  // （3.14 起压缩器把 h 改名为 _，witness 串判版）。旧 h. 形态注入在新内核上运行时
-  // h.ipcRenderer 为 undefined（renderer 报「Cannot read properties of undefined
+  // （3.14 起压缩器把 h 改名为 _，3.16 起又改名 S；witness 串判版）。旧形态注入在新内核
+  // 上运行时 X.ipcRenderer 为 undefined（renderer 报「Cannot read properties of undefined
   // (reading 'invoke')」），故按内核形态选注入串，漂移升级路径据此剥旧换新。
-  const preWitness = ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null;
-  const preInjV1 = Buffer.from(ph.PRELOAD_INJECT, "utf8");
-  const preInjV2 = ph.PRELOAD_INJECT_V2 ? Buffer.from(ph.PRELOAD_INJECT_V2, "utf8") : null;
+  const preForms = [
+    { witness: ph.PRELOAD_V3_WITNESS ? Buffer.from(ph.PRELOAD_V3_WITNESS, "utf8") : null,
+      inject: ph.PRELOAD_INJECT_V3 ? Buffer.from(ph.PRELOAD_INJECT_V3, "utf8") : null },
+    { witness: ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null,
+      inject: ph.PRELOAD_INJECT_V2 ? Buffer.from(ph.PRELOAD_INJECT_V2, "utf8") : null },
+    { witness: null, inject: Buffer.from(ph.PRELOAD_INJECT, "utf8") },
+  ].filter((f) => f.inject);
   const preNow = mem.get(MH_PRELOAD_REL);
-  const preWantsV2 = !!(preWitness && preInjV2 && preNow.includes(preWitness));
-  const preInjCur = preWantsV2 ? preInjV2 : preInjV1;
-  const preInjPrev = preWantsV2 ? preInjV1 : preInjV2;
+  const preFormCur = preForms.find((f) => !f.witness || preNow.includes(f.witness)) || preForms[preForms.length - 1];
+  const preInjCur = preFormCur.inject;
+  const preInjPrevList = preForms.map((f) => f.inject).filter((b) => b !== preInjCur);
   const preDrift = !preNow.includes(preInjCur);
 
   let saved = null;
@@ -1602,6 +1646,23 @@ function processModelhub(asar, checkOnly, revert, mem) {
       return false;
     }
     const stickyRec = saved && (saved.files || []).find((f) => f.path === rendRel && f.sticky_after);
+    // 还原用的三点注入字节：先按当前命中的锚点组（mode），再回落到其它变体——
+    // 已打安装的 mode 探测基于「注入块是否在」的标记，与打补丁时的版本可能不同
+    // （例如宿主升级后 sidecar 记录了旧版本，但注入仍在），故逐组尝试。
+    const sigNewCands = [sigNewBuf, v7SigNew, v6SigNew, v5SigNew, v4SigNew, v3SigNew, v2SigNew].filter(Boolean);
+    const sigOldCands = [sigOldBuf, v7SigOld, v6SigOld, v5SigOld, v4SigOld, v3SigOld, v2SigOld].filter(Boolean);
+    const callCands = [callAnchorBuf, v7Buf, v6Buf, v5Buf, v4Buf, v3Buf, v2Buf].filter(Boolean);
+    const propCands = [propBuf, v7PropBuf, v6PropBuf, v5PropBuf, v4PropBuf, v3PropBuf, v2PropBuf].filter(Boolean);
+    const pickPair = (cur, newC, oldC) => {
+      for (let i = 0; i < newC.length; i++) {
+        if (countBytes(cur, newC[i]) === 1) {
+          const oldB = oldC[i];
+          if (oldB && countBytes(cur, oldB) === 0) return { nb: newC[i], ob: oldB };
+        }
+      }
+      return null;
+    };
+    const pickOne = (cur, cands) => cands.find((b) => countBytes(cur, b) === 1) || null;
     const overwrite = {};
     let exact = 0, fallback = 0;
     for (const [rel, mark] of marks) {
@@ -1621,14 +1682,17 @@ function processModelhub(asar, checkOnly, revert, mem) {
         const h = Buffer.from(ph.MAIN_HANDLERS, "utf8");
         if (countBytes(cur, h) === 1) r = replaceOnce(cur, h, Buffer.alloc(0));
       } else {
-        // renderer：优先剥离 v2.1 三点注入（签名/传参/头部按钮），其次旧版 v2 注入块，最后走 v1 逐点反替换
-        if (sigNewBuf && countBytes(cur, sigNewBuf) === 1) {
-          let r2 = replaceOnce(cur, sigNewBuf, sigOldBuf);
-          const propApplied = Buffer.concat([callAnchorBuf, propBuf]);
-          if (countBytes(r2, propApplied) !== 1) {
+        // renderer：优先剥离三点注入（签名/传参/头部按钮，逐变体尝试），其次旧版 v2 注入块，最后走 v1 逐点反替换
+        const pair = pickPair(cur, sigNewCands, sigOldCands);
+        if (pair) {
+          let r2 = replaceOnce(cur, pair.nb, pair.ob);
+          const callB = pickOne(cur, callCands);
+          const propB = pickOne(cur, propCands);
+          const propApplied = callB && propB ? Buffer.concat([callB, propB]) : null;
+          if (!propApplied || countBytes(r2, propApplied) !== 1) {
             r = null;   // 传参串漂移：走 sidecar 字节兜底
           } else {
-            r2 = replaceOnce(r2, propApplied, callAnchorBuf);
+            r2 = replaceOnce(r2, propApplied, callB);
             r2 = mhV21StripHeader(r2);
             if (r2 === null) {
               r = null;   // 头部注入块漂移：走 sidecar 字节兜底
@@ -1770,11 +1834,12 @@ function processModelhub(asar, checkOnly, revert, mem) {
     mem.set(rendRel, rendNew);
     let preFixed = false;
     if (preDrift) {
-      if (!preInjPrev || countBytes(preNow, preInjPrev) !== 1) {
+      const prevHit = preInjPrevList.find((inj) => countBytes(preNow, inj) === 1);
+      if (!prevHit) {
         console.log(`[!] ${asar}\n    preload 旧注入形态不唯一/未命中，拒绝盲改；先 --modelhub --revert 再重打`);
         return false;
       }
-      const preStripped = replaceOnce(preNow, preInjPrev, Buffer.alloc(0));
+      const preStripped = replaceOnce(preNow, prevHit, Buffer.alloc(0));
       const preAnchor = Buffer.from(ph.PRELOAD_ANCHOR, "utf8");
       if (countBytes(preStripped, preAnchor) !== 1) {
         console.log(`[!] ${asar}\n    剥离后 preload 锚点出现 ${countBytes(preStripped, preAnchor)} 次（期望 1），拒绝盲改`);
@@ -1885,7 +1950,7 @@ function processModelhub(asar, checkOnly, revert, mem) {
   commit(".modelhub-tmp", (newSize) => writeJson(side, {
     asar_size: newSize,
     renderer_path: rendRel,
-    mode: mode === "v2" ? "v2.1" : mode === "v3" ? "v3.1" : mode === "v4" ? "v4.1" : mode === "v5" ? "v5.1" : mode,
+    mode: mode === "v1" ? "v1" : `${mode}.1`,
     files: originals.map(([rel, b]) => ({
       path: rel, size: b.length, original_b64: b.toString("base64"),
       ...(rel === rendRel && stickyAfter ? { sticky_after: stickyAfter } : {}),
@@ -1963,8 +2028,14 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   // 内核 preload 第 2 代形态见证（3.14 起原生 connectRemote 体的 ipcRenderer 绑定名 h→_）：
   // 该形态下必须用 V3 注入串，否则运行时 h.ipcRenderer 为 undefined（「reading 'invoke'」报错）。
   const injectV3 = ph.ENH_PRELOAD_INJECT_V3 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V3, "utf8") : null;
+  const injectV4 = ph.ENH_PRELOAD_INJECT_V4 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V4, "utf8") : null;
   const preWitness = ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null;
-  const injCur = injectV3 && preWitness && preBuf.includes(preWitness) ? injectV3 : injectNew;
+  // 内核 preload 第 2/3 代形态见证（3.14 起原生 connectRemote 体的 ipcRenderer 绑定名 h→_，
+  // 3.16 起 _→S）：命中哪代 witness 就必须用对应代注入串，否则运行时 X.ipcRenderer 为
+  // undefined（「reading 'invoke'」报错）。
+  const preWitness3 = ph.PRELOAD_V3_WITNESS ? Buffer.from(ph.PRELOAD_V3_WITNESS, "utf8") : null;
+  const injCur = injectV4 && preWitness3 && preBuf.includes(preWitness3) ? injectV4
+    : injectV3 && preWitness && preBuf.includes(preWitness) ? injectV3 : injectNew;
   const preIsCurrent = preBuf.includes(injCur);
   const handlers = buildEnhanceMainBlock(ph);
   const isV2 = mainBuf.includes(Buffer.from("zcode-enhance:list-models", "utf8"));
@@ -2020,7 +2091,7 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
 
   /** 移除 preload 注入串：按内核形态的新版优先，旧版串兜底（升级前的存量安装）。 */
   function stripPreload(buf, bad) {
-    for (const inj of [injectV3, injectNew, injectOld].filter(Boolean)) {
+    for (const inj of [injectV4, injectV3, injectNew, injectOld].filter(Boolean)) {
       if (!buf.includes(inj)) continue;
       if (countBytes(buf, inj) !== 1) { bad.push("preload 注入串不唯一"); return buf; }
       return replaceOnce(buf, inj, Buffer.alloc(0));
@@ -2155,17 +2226,10 @@ function revertMhRenderer(cur, ph, stickyAfterB64) {
   return r;
 }
 
-// ---------------------------------------------------------------- 全消息可编辑
-
-function processEditAll(target, checkOnly, revert) {
-  const side = target + ".editall.json";
-  const ph = loadMhPayload();
-  // 每项为变体列表：旧内核 y/m → v/f → 3.12.x A/w → 3.14.x E/w（混淆名随版本漂移，结构不变），打时按内容命中选一。
-  const variants = [
-    ["P1", [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2], [ph.P1_OLD_V3, ph.P1_NEW_V3], [ph.P1_OLD_V4, ph.P1_NEW_V4]]],
-    ["P2", [[ph.P2_OLD, ph.P2_NEW], [ph.P2_OLD_V2, ph.P2_NEW_V2]]],
-  ].map(([lbl, list]) => [lbl, list.map(([o, n]) => [Buffer.from(o, "utf8"), Buffer.from(n, "utf8")])]);
-
+function processModelRetry(target, checkOnly, revert) {
+  // 3009 业务码表项：结构固定、枚举变量名（as/bs/tl 之类）随压缩版本漂移。
+  // 同时匹配 !1（未打）与 !0（已打），便于状态判定与反向还原。
+  const ANCHOR_RE = /\["3009",\{code:[A-Za-z_$][\w$]*\.ModelRateLimited,reason:[A-Za-z_$][\w$]*\.RateLimited,retryReason:[A-Za-z_$][\w$]*\.RateLimited,retryable:(!1|!0)\}\]/g;
   let data;
   try {
     data = fs.readFileSync(target);
@@ -2174,8 +2238,131 @@ function processEditAll(target, checkOnly, revert) {
     return;
   }
 
-  const cnt = (v) => [countBytes(data, v[0]), countBytes(data, v[1])];
-  const applied = variants.filter(([, list]) => list.some((v) => cnt(v)[1] >= 1 && cnt(v)[0] === 0)).length;
+  const hits = [...data.toString("latin1").matchAll(ANCHOR_RE)].map((m) => ({ index: m.index, text: m[0], retryable: m[1] }));
+  const off = hits.filter((h) => h.retryable === "!1").length;
+  const on = hits.filter((h) => h.retryable === "!0").length;
+  const st = !hits.length ? "不适用" : (on === 1 && off === 0 ? "已打" : (off === 1 && on === 0 ? "未打" : "部分（异常）"));
+  console.log(`[*] ${target}`);
+  console.log(`    3009 自动重试: ${st}`);
+
+  if (!hits.length) {
+    console.log("    [i] 未找到 3009 业务码表项（code/reason/retryReason 结构或字段顺序已变），本补丁在该内核不适用，未修改");
+    return;
+  }
+
+  if (checkOnly) return;
+
+  if (revert) {
+    if (!on) { console.log("    [.] 未打，跳过"); return; }
+    if (hits.length !== 1 || on !== 1 || off !== 0) {
+      console.log(`    [!] 状态异常（锚点 ${hits.length} 处：retryable=true ${on} / false ${off}），拒绝盲改，请先人工核实内核`);
+      return;
+    }
+    const h = hits[0];
+    const rel = h.text.indexOf("retryable:!0");
+    const at = h.index + rel;
+    const changed = Buffer.concat([data.subarray(0, at), Buffer.from("retryable:!1", "latin1"), data.subarray(at + "retryable:!0".length)]);
+    if (!writeKernelChecked(target, changed, ".modelretry-tmp.cjs", "    [+] 已反向替换还原 3009 retryable=false（node --check 通过）")) return;
+    return;
+  }
+
+  if (st === "已打") { console.log("    [=] 已打，跳过"); return; }
+  if (hits.length !== 1 || off !== 1 || on !== 0) {
+    console.log(`    [!] 锚点命中异常（共 ${hits.length} 处：retryable=true ${on} / false ${off}），版本可能不兼容，拒绝盲改`);
+    return;
+  }
+
+  const h = hits[0];
+  const rel = h.text.indexOf("retryable:!1");
+  const at = h.index + rel;
+  const changed = Buffer.concat([data.subarray(0, at), Buffer.from("retryable:!0", "latin1"), data.subarray(at + "retryable:!1".length)]);
+  if (changed.length !== data.length) {
+    console.log("    [!] 内部错误：替换前后长度不一致，原文件未动");
+    return;
+  }
+  writeKernelChecked(target, changed, ".modelretry-tmp.cjs", "    [+] 3009 业务码已翻为 retryable=true（node --check 通过）");
+}
+
+/** 写内核前跑 node --check，通过后原子替换；失败零改动。 */
+function writeKernelChecked(target, data, tmpSuffix, okMsg) {
+  const tmp = target + tmpSuffix;
+  try {
+    fs.writeFileSync(tmp, data);
+    const rc = spawnSync(process.execPath, ["--check", tmp], { timeout: 120000 });
+    if (rc.status !== 0) {
+      rmQuiet(tmp);
+      const err = ((rc.stderr || "") + "").split("\n").slice(0, 4).join("\n        ");
+      console.log(`    [!] 补丁后语法自检失败（node --check），原文件未动：\n        ${err}`);
+      return false;
+    }
+    renameReplace(tmp, target);
+    console.log(okMsg);
+    return true;
+  } catch (e) {
+    rmQuiet(tmp);
+    if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
+      console.log("    [!] 无权限写入或文件被占用，未修改");
+      return false;
+    }
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------- 全消息可编辑
+
+function processEditAll(target, checkOnly, revert) {
+  const side = target + ".editall.json";
+  const ph = loadMhPayload();
+  // 字面变体：历届内核实测锚点（y/m → v/f → A/w → E/w → v/f/b → C/S，混淆名随版本漂移，结构不变），打时按内容命中选一。
+  const literal = {
+    P1: [[ph.P1_OLD, ph.P1_NEW], [ph.P1_OLD_V2, ph.P1_NEW_V2], [ph.P1_OLD_V3, ph.P1_NEW_V3], [ph.P1_OLD_V4, ph.P1_NEW_V4], [ph.P1_OLD_V5, ph.P1_NEW_V5], [ph.P1_OLD_V6, ph.P1_NEW_V6]],
+    P2: [[ph.P2_OLD, ph.P2_NEW], [ph.P2_OLD_V2, ph.P2_NEW_V2], [ph.P2_OLD_V3, ph.P2_NEW_V3]],
+  };
+  // 结构化锚点兜底：压缩器历来只改符号名不改结构，字面变体全部失配时按结构正则捕获
+  // 实际变量名、动态生成替换串——纯改名类版本漂移零适配自动命中。与字面变体同一
+  // 唯一性纪律：恰 1 处命中才动手。P1 的补丁形态抹掉了行比较变量名，还原依赖 sidecar
+  // 记录的原文；P2 补丁形态信息完整，可现场反推。
+  const p1New = (k, c) => `else if(${k}.kind==="userInput")this.entityIdByRowId.get(${k}.rowId)&&this.editTargetByEntityId.has(this.entityIdByRowId.get(${k}.rowId))&&this.messageIdByRowId.has(${k}.rowId)?(${c}.canEdit=!0,${c}.editDisposition="rewind"):(delete ${c}.canEdit,delete ${c}.editDisposition)`;
+  const p2Old = (t, n) => `resolveEditTargetByEntityId(${t}){if(${t}!==this.currentEditableEntityId)return null;let ${n}=this.editTargetByEntityId.get(${t});`;
+  const p2New = (t, n) => `resolveEditTargetByEntityId(${t}){let ${n}=this.editTargetByEntityId.get(${t});`;
+  const structural = {
+    P1: {
+      oldRe: /else if\((\w+)\.kind==="userInput"\)\1\.rowId===(\w+)\?\((\w+)\.canEdit=!0,\3\.editDisposition="rewind"\):\(delete \3\.canEdit,delete \3\.editDisposition\)/,
+      patchedRe: /else if\((\w+)\.kind==="userInput"\)this\.entityIdByRowId\.get\(\1\.rowId\)&&this\.editTargetByEntityId\.has\(this\.entityIdByRowId\.get\(\1\.rowId\)\)&&this\.messageIdByRowId\.has\(\1\.rowId\)\?\((\w+)\.canEdit=!0,\2\.editDisposition="rewind"\):\(delete \2\.canEdit,delete \2\.editDisposition\)/,
+      patchedFromOldCaps: (caps) => p1New(caps[0], caps[2]),
+      oldFromPatchedCaps: null,
+    },
+    P2: {
+      oldRe: /resolveEditTargetByEntityId\((\w+)\)\{if\(\1!==this\.currentEditableEntityId\)return null;let (\w+)=this\.editTargetByEntityId\.get\(\1\);/,
+      patchedRe: /resolveEditTargetByEntityId\((\w+)\)\{let (\w+)=this\.editTargetByEntityId\.get\(\1\);/,
+      patchedFromOldCaps: (caps) => p2New(caps[0], caps[1]),
+      oldFromPatchedCaps: (caps) => p2Old(caps[0], caps[1]),
+    },
+  };
+
+  let data;
+  try {
+    data = fs.readFileSync(target);
+  } catch {
+    console.log(`[!] 无权限读取 ${target}`);
+    return;
+  }
+  // P1/P2 锚点与替换串均为纯 ASCII，统一在 latin1 视图上匹配/替换（字节 1:1 往返无损）
+  const text = data.toString("latin1");
+  const cntStr = (s) => { let n = 0, i = 0; while ((i = text.indexOf(s, i)) !== -1) { n++; i += s.length; } return n; };
+  const cnt = (v) => [cntStr(v[0]), cntStr(v[1])];
+  const structFirst = (re) => new RegExp(re.source, "g").exec(text);
+  const structCount = (re) => { const r = new RegExp(re.source, "g"); let n = 0; while (r.exec(text) !== null) n++; return n; };
+
+  let sideRec = null;
+  try { sideRec = readJson(side); } catch { sideRec = null; }
+
+  const appliedLbl = {};
+  for (const lbl of ["P1", "P2"]) {
+    appliedLbl[lbl] = literal[lbl].some((v) => cnt(v)[1] >= 1 && cnt(v)[0] === 0)
+      || structFirst(structural[lbl].patchedRe) !== null;
+  }
+  const applied = ["P1", "P2"].filter((l) => appliedLbl[l]).length;
   const st = applied === 2 ? "已打" : (applied === 1 ? "部分（异常）" : "未打");
   console.log(`[*] ${target}`);
   console.log(`    全消息可编辑: ${st}`);
@@ -2184,12 +2371,22 @@ function processEditAll(target, checkOnly, revert) {
 
   if (revert) {
     if (applied === 0) { console.log("    [.] 未打，跳过"); return; }
-    let changed = data;
-    for (const [, list] of variants)
-      for (const v of list)
-        if (cnt(v)[1] === 1) changed = replaceOnce(changed, v[1], v[0]);
+    let out = text;
+    let ok = true;
+    for (const lbl of ["P1", "P2"]) {
+      if (!appliedLbl[lbl]) continue;
+      const litHit = literal[lbl].find((v) => cntStr(v[1]) === 1);
+      if (litHit) { out = out.replace(litHit[1], () => litHit[0]); continue; }
+      const m = structFirst(structural[lbl].patchedRe);
+      if (m && structural[lbl].oldFromPatchedCaps) { out = out.replace(m[0], () => structural[lbl].oldFromPatchedCaps(m.slice(1))); continue; }
+      const rec = sideRec && sideRec.struct && sideRec.struct[lbl];
+      if (rec && cntStr(rec.new) === 1) { out = out.replace(rec.new, () => rec.old); continue; }
+      console.log(`    [!] 锚点 ${lbl} 无法安全还原（字面变体与结构形态均未唯一命中，sidecar 记录${rec ? "不匹配" : "缺失"}），拒绝盲改`);
+      ok = false;
+    }
+    if (!ok) return;
     try {
-      fs.writeFileSync(target, changed);
+      fs.writeFileSync(target, Buffer.from(out, "latin1"));
       rmQuiet(side);
       console.log("    [+] 已反向替换还原 P1/P2 两处");
     } catch {
@@ -2203,23 +2400,30 @@ function processEditAll(target, checkOnly, revert) {
     console.log("    [!] 状态异常（部分替换），先 --edit-all --revert 再重打");
     return;
   }
-  for (const [lbl, list] of variants) {
-    const hit = list.filter((v) => cnt(v)[0] === 1 && cnt(v)[1] === 0);
-    if (hit.length !== 1) {
-      const detail = list.map((v) => `旧=${cnt(v)[0]} 新=${cnt(v)[1]}`).join("，");
-      console.log(`    [!] 锚点 ${lbl} 变体命中 ${hit.length} 个（${detail}），版本可能不兼容，拒绝盲改`);
-      return;
+  let out = text;
+  const structRec = {};
+  for (const lbl of ["P1", "P2"]) {
+    const litHit = literal[lbl].filter((v) => cnt(v)[0] === 1 && cnt(v)[1] === 0);
+    if (litHit.length === 1) { out = out.replace(litHit[0][0], () => litHit[0][1]); continue; }
+    const oc = structCount(structural[lbl].oldRe);
+    const pc = structCount(structural[lbl].patchedRe);
+    if (litHit.length === 0 && oc === 1 && pc === 0) {
+      const m = structFirst(structural[lbl].oldRe);
+      const newStr = structural[lbl].patchedFromOldCaps(m.slice(1));
+      structRec[lbl] = { old: m[0], new: newStr };
+      out = out.replace(m[0], () => newStr);
+      console.log(`    [i] ${lbl} 字面变体未命中，走结构化锚点（捕获变量 ${m.slice(1).join(", ")}）`);
+      continue;
     }
+    const detail = literal[lbl].map((v) => `旧=${cnt(v)[0]} 新=${cnt(v)[1]}`).join("，");
+    console.log(`    [!] 锚点 ${lbl} 字面变体与结构匹配均未唯一命中（字面: ${detail}；结构: 旧=${oc} 已打形态=${pc}），版本可能不兼容，拒绝盲改`);
+    return;
   }
-  let changed = data;
-  for (const [, list] of variants)
-    for (const v of list)
-      if (cnt(v)[0] === 1) changed = replaceOnce(changed, v[0], v[1]);
 
   // 语法自检：写临时文件跑 node --check，失败零改动（.cjs 后缀让 node 可识别）
   const tmp = target + ".editall-tmp.cjs";
   try {
-    fs.writeFileSync(tmp, changed);
+    fs.writeFileSync(tmp, Buffer.from(out, "latin1"));
     const node = process.execPath;
     const rc = spawnSync(node, ["--check", tmp], { timeout: 120000 });
     if (rc.status !== 0) {
@@ -2229,7 +2433,7 @@ function processEditAll(target, checkOnly, revert) {
       return;
     }
     renameReplace(tmp, target);
-    writeJson(side, { applied: true });
+    writeJson(side, { applied: true, ...(Object.keys(structRec).length ? { struct: structRec } : {}) });
     console.log("    [+] P1/P2 两处替换已写入（node --check 通过）");
   } catch (e) {
     rmQuiet(tmp);
@@ -2266,6 +2470,7 @@ function usage() {
   --enhance-btn  增强提示词按钮：改写草稿（右键面板选模型/模式）
   --quota-banner 去额度骚扰横幅：关闭「额度剩余 x%，可升级」升级广告（保留耗尽/受限提示）
   --edit-all     全消息可编辑
+  --model-retry  模型 3009 自动重试：把 Start Plan「并发上限」业务码翻为可重试，走通用指数退避
   --tps-src <p>  指定注入的 zcode-tps.js 路径
   --enhance-src <p> 指定注入的 zcode-enhance.js 路径
 目标：安装根目录 / macOS .app 包 / zcode.cjs 路径；缺省自动探测全部安装`);
@@ -2276,6 +2481,7 @@ function main() {
   const opts = {
     target: null, check: false, revert: false, extract: false,
     usageChart: false, tpsFooter: false, modelhub: false, enhanceBtn: false, editAll: false, menuWidth: false, continueBtn: false, quotaBanner: false,
+    modelRetry: false,
     tpsSrc: null, enhanceSrc: null, contSrc: null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -2293,6 +2499,7 @@ function main() {
       case "--quota-banner": opts.quotaBanner = true; break;
       case "--enhance-src": opts.enhanceSrc = argv[++i]; break;
       case "--edit-all": opts.editAll = true; break;
+      case "--model-retry": opts.modelRetry = true; break;
       case "--tps-src": opts.tpsSrc = argv[++i]; break;
       case "--cont-src": opts.contSrc = argv[++i]; break;
       case "-h": case "--help": usage(); return;
@@ -2373,15 +2580,28 @@ function main() {
     return;
   }
 
-  if (opts.editAll) {
+  if (opts.editAll || opts.modelRetry) {
     const mode = opts.check ? "检查" : (opts.revert ? "还原" : "打补丁");
-    console.log(`=== 全消息可编辑补丁，目标 ${targets.length} 处，模式：${mode} ===`);
-    for (const t of targets) {
-      try { processEditAll(t, opts.check, opts.revert); }
-      catch (e) {
-        if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
-          console.log(`[!] ${t}\n    无写入权限或文件被占用，请检查权限/退出 ZCode 后重试`);
-        } else throw e;
+    if (opts.editAll) {
+      console.log(`=== 全消息可编辑补丁，目标 ${targets.length} 处，模式：${mode} ===`);
+      for (const t of targets) {
+        try { processEditAll(t, opts.check, opts.revert); }
+        catch (e) {
+          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
+            console.log(`[!] ${t}\n    无写入权限或文件被占用，请检查权限/退出 ZCode 后重试`);
+          } else throw e;
+        }
+      }
+    }
+    if (opts.modelRetry) {
+      console.log(`=== 模型 3009 自动重试补丁，目标 ${targets.length} 处，模式：${mode} ===`);
+      for (const t of targets) {
+        try { processModelRetry(t, opts.check, opts.revert); }
+        catch (e) {
+          if (e.code === "EACCES" || e.code === "EPERM" || e.code === "EBUSY") {
+            console.log(`[!] ${t}\n    无写入权限或文件被占用，请检查权限/退出 ZCode 后重试`);
+          } else throw e;
+        }
       }
     }
     if (!opts.check && !opts.revert) console.log("=== 提示：完全退出并重启 ZCode 后生效；升级后需重新执行 ===");

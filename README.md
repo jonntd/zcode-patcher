@@ -2,7 +2,7 @@
 
 ZCode 客户端本地补丁工具。零依赖 Node.js 脚本 + Go 单文件启动器，一套代码交叉编译出 Windows / macOS / Linux 的原生可执行文件。
 
-9 项补丁：思考等级透传、全消息可编辑、用量页去截断、模型菜单加宽、继续按钮、TPS 统计栏、模型拉取、增强提示词按钮、去额度骚扰横幅。全部幂等、可检查、可还原。
+10 项补丁：思考等级透传、全消息可编辑、模型 3009 自动重试、用量页去截断、模型菜单加宽、继续按钮、TPS 统计栏、模型拉取、增强提示词按钮、去额度骚扰横幅。全部幂等、可检查、可还原。
 
 > **思考等级透传 × ZCode ≥3.12**：新内核已移除档位换算函数（providerOptionsByLevel 仅存 schema），补丁在 3.12+ 显示「不适用」是预期行为。原生替代：设置 → 模型设置 → 对应模型的「推理档位映射」，按档位直接 set/unset 任意配置路径（如 `reasoningEffort`、`thinking.budgetTokens`），能力等价且可视化。
 
@@ -30,7 +30,7 @@ zcode-patch-win-x64.exe            # Windows
 |---|---|
 | ↑ / ↓ | 移动选择 |
 | Enter（或 `h`） | 执行：已打→还原，未打/未知→打（幂等，可安全重复） |
-| 1-9 | 快选对应补丁 |
+| 1-9/0 | 快选对应补丁（0 = 第 10 项） |
 | `/` | 查看全部补丁状态总览 |
 | `q` / Ctrl-C | 退出 |
 
@@ -82,7 +82,9 @@ zcode-patch-win-x64.exe            # Windows
 ./zcode-patch-macos-arm64 --help                       # 全部参数
 ```
 
-功能开关：`--usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner --edit-all`；通用参数：`--check / --revert / --extract`。
+功能开关：`--usage-chart --menu-width --continue-btn --tps-footer --modelhub --enhance-btn --quota-banner --edit-all --model-retry`；通用参数：`--check / --revert / --extract`。
+
+> `--model-retry`：把内核业务码 `3009`（Start Plan「model concurrency limit exceeded」）的 `retryable:false` 等长翻成 `true`，让它进入内核自带的 11 次指数退避（2s 起、×2、上限 60s、尊重 Retry-After、带 jitter）。次数/间隔可用环境变量 `ZCODE_MODEL_RETRY_MAX_RETRIES`（实际尝试 N+1 次）、`ZCODE_MODEL_RETRY_BASE_DELAY_MS`、`ZCODE_MODEL_RETRY_BACKOFF_FACTOR`、`ZCODE_MODEL_RETRY_MAX_DELAY_MS` 调整；macOS GUI 需 `launchctl setenv` 后重启 ZCode。
 
 > 二进制对 ZCode 安装的探测、备份、还原逻辑全部复用自 `scripts/zcode-patcher.js`，未作改动。Windows 的 UTF-8/VT 控制台修复见 `run_windows.go`。
 
