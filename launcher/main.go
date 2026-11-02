@@ -85,6 +85,12 @@ func materialize() (string, error) {
 			mainPath = p
 		}
 	}
+	// version 必须被实际引用（写入缓存标记文件）：零引用的包级变量会被链接器
+	// 连同 -ldflags -X 注入值一起消除，产物里 grep 不到版本号（auto-release 的
+	// 产物校验因此失败过两轮）。同时它也是「缓存是否陈旧」的外部判据。
+	if err := writeIfChanged(filepath.Join(unpackDir, ".version"), []byte(version+"\n")); err != nil {
+		return "", err
+	}
 	return mainPath, nil
 }
 
