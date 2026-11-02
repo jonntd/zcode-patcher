@@ -130,13 +130,15 @@ test("拉取模型：自然序排序、确认去重与载荷漂移升级", () =>
   assert.ok(patcher.includes("边界标记剥旧重注"), "漂移升级未按边界标记剥离");
 });
 
-test("preload 注入随内核形态选变体（h→_→S）", () => {
+test("preload 注入随内核形态选变体（h→_→S，3.17 见证 i→r）", () => {
   const ph = JSON.parse(fs.readFileSync(path.join(ROOT, "scripts/modelhub_payload.json"), "utf8"));
   assert.ok(ph.PRELOAD_V2_WITNESS && ph.PRELOAD_V2_WITNESS.includes("connectRemote:s((t,n,i)=>_.ipcRenderer.invoke"),
     "见证串必须锚定 3.14+ 原生 connectRemote 体");
   assert.ok(ph.PRELOAD_V3_WITNESS && ph.PRELOAD_V3_WITNESS.includes("connectRemote:s((t,n,i)=>S.ipcRenderer.invoke"),
     "见证串必须锚定 3.16+ 原生 connectRemote 体");
-  for (const [curKey, oldKey] of [["PRELOAD_INJECT_V2", "PRELOAD_INJECT"], ["PRELOAD_INJECT_V3", "PRELOAD_INJECT_V2"], ["ENH_PRELOAD_INJECT_V3", "ENH_PRELOAD_INJECT"]]) {
+  assert.ok(ph.PRELOAD_V4_WITNESS && ph.PRELOAD_V4_WITNESS.includes("connectRemote:s((t,n,r)=>S.ipcRenderer.invoke"),
+    "见证串必须锚定 3.17+ 原生 connectRemote 体（第三参 i→r，绑定仍 S）");
+  for (const [curKey, oldKey] of [["PRELOAD_INJECT_V2", "PRELOAD_INJECT"], ["PRELOAD_INJECT_V3", "PRELOAD_INJECT_V2"], ["PRELOAD_INJECT_V4", "PRELOAD_INJECT_V3"], ["ENH_PRELOAD_INJECT_V3", "ENH_PRELOAD_INJECT"]]) {
     assert.ok(ph[curKey], "缺少 " + curKey + " 变体");
     assert.ok(ph[curKey].includes(".ipcRenderer.invoke"), curKey + " 未绑定 ipcRenderer");
     // 变体除绑定名外必须与旧形态逐字符一致（h. 与 _. / S. 等长），替换语义不变
@@ -144,11 +146,26 @@ test("preload 注入随内核形态选变体（h→_→S）", () => {
     assert.ok(ph[curKey].length === ph[oldKey].length, curKey + " 与旧形态长度不一致");
     assert.ok(norm(ph[curKey]) === norm(ph[oldKey]), curKey + " 与旧形态除绑定名外存在漂移");
   }
+  // V5 在 V4 基础上语义升级（+curModel 第五参，跟随会话当前模型），不再是纯绑定名变体
+  assert.ok(ph.ENH_PRELOAD_INJECT_V5.includes("(e,t,n,r,s)=>S.ipcRenderer.invoke"), "V5 未扩展为五参");
+  assert.ok(ph.ENH_PRELOAD_INJECT_V5.includes("curModel:s}"), "V5 注入串缺 curModel 字段");
+  // 增强主进程链路：渠道收集纳入 builtin（官方计划用户增强可用）、跟随会话模型
+  assert.ok(ph.ENH_MAIN_HANDLERS.includes("enabled!==false||id===pid||String(id).startsWith(\"builtin:\")"), "run/list 渠道收集未纳入 builtin 与选中渠道");
+  assert.ok(ph.ENH_MAIN_HANDLERS.includes("curModel"), "run handler 缺会话模型跟随");
+  assert.ok(ph.ENH_MAIN_HANDLERS.includes("builtin:String(id).startsWith"), "list-models 缺官方渠道徽标字段");
   const patcher = fs.readFileSync(CLI, "utf8");
   assert.ok(patcher.includes("preFormCur"), "modelhub 未按内核形态选择注入变体");
   assert.ok(patcher.includes("preIsCurrent"), "enhance 未按内核形态选择注入变体");
   assert.ok(patcher.includes("preload 注入形态与内核不匹配"), "--check 未暴露形态不匹配");
-  assert.ok(patcher.includes("[injectV4, injectV3, injectNew, injectOld]"), "enhance 剥离未覆盖全部注入形态");
+  assert.ok(patcher.includes("[injectV5, injectV4, injectV3, injectNew, injectOld]"), "enhance 剥离未覆盖全部注入形态");
+  assert.ok(patcher.includes("{ n: 8, buf: v8Buf, sigOld: v8SigOld, sigNew: v8SigNew, prop: v8PropBuf }"), "modelhub gens 表缺 V8 组");
+  assert.ok(patcher.includes("PRELOAD_V4_WITNESS"), "preForms 链缺 V4 见证");
+  assert.ok(patcher.includes("preWitness4"), "enhance injCur 链缺 V4 见证");
+  // 注入按钮统一挂左下 leading actions（ZCodium 原生版布局，模式选择器旁），旧中组仅作回落
+  for (const f of ["scripts/zcode-enhance.js", "scripts/zcode-continue.js", "scripts/zcode-tps.js"]) {
+    const text = fs.readFileSync(path.join(ROOT, f), "utf8");
+    assert.ok(text.includes("chat-mode-select-trigger"), f + " 缺少 leading actions 定位锚");
+  }
 });
 
 test("模型 3009 重试：只翻转 3009，等长、幂等、可还原", () => {
@@ -243,6 +260,216 @@ test("全消息可编辑：字面与结构均失配时拒绝盲改", () => {
   assert.strictEqual(r.status, 0, r.stderr || r.stdout);
   assert.ok(/拒绝盲改/.test(r.stdout), "结构失配未拒绝盲改");
   assert.strictEqual(fs.readFileSync(target, "utf8"), "module.exports={};", "拒绝后文件被改动");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- 渲染层结构化锚点兜底（quota/menu-width）与 --doctor 体检 ---
+
+/** 手工构建最小合法 asar（树 + 数据区，offset 相对 dataStart，与 asarOpen 读法一致）。 */
+function makeTestAsar(asarPath, files) {
+  const header = { files: {} };
+  const chunks = [];
+  let offset = 0;
+  for (const f of files) {
+    const parts = f.path.split("/");
+    let node = header;
+    for (let i = 0; i < parts.length - 1; i++) node = node.files[parts[i]] = node.files[parts[i]] || { files: {} };
+    node.files[parts[parts.length - 1]] = { size: f.data.length, offset: String(offset) };
+    chunks.push(f.data);
+    offset += f.data.length;
+  }
+  const jsonBytes = Buffer.from(JSON.stringify(header), "utf8");
+  const pad = (4 - (jsonBytes.length % 4)) % 4;
+  const head = Buffer.alloc(16);
+  head.writeUInt32LE(4, 0);
+  head.writeUInt32LE(8 + jsonBytes.length + pad, 4);
+  head.writeUInt32LE(4 + jsonBytes.length + pad, 8);
+  head.writeUInt32LE(jsonBytes.length, 12);
+  fs.writeFileSync(asarPath, Buffer.concat([head, jsonBytes, Buffer.alloc(pad, 0), ...chunks]));
+}
+
+/** 渲染层候选文件要求 size≥100000，用纯 ASCII 行注释垫到门槛之上。 */
+const padJs = (body) => Buffer.from(body + "\n//" + "x".repeat(120000), "utf8");
+
+/** 合成最小安装布局：resources/app.asar + resources/glm/zcode.cjs（CLI 只接受安装根/.app/zcode.cjs）。
+ *  返回安装根目录，asar 写在 <root>/resources/app.asar。 */
+function makeFakeInstall(dir, asarFiles) {
+  const root = path.join(dir, "ZCode.app", "Contents");
+  fs.mkdirSync(path.join(root, "resources", "glm"), { recursive: true });
+  fs.writeFileSync(path.join(root, "resources", "glm", "zcode.cjs"), "module.exports={};");
+  makeTestAsar(path.join(root, "resources", "app.asar"), asarFiles);
+  return root;
+}
+
+/** 从合成 asar 中读取指定条目字节（与 makeTestAsar 的布局约定一致）。 */
+function readTestAsarEntry(asarPath, entryPath) {
+  const raw = fs.readFileSync(asarPath);
+  const headerSize = raw.readUInt32LE(4);
+  const header = JSON.parse(raw.subarray(16, 16 + raw.readUInt32LE(12)).toString("utf8"));
+  let node = header;
+  for (const part of entryPath.split("/")) node = node.files[part];
+  const off = 8 + headerSize + Number(node.offset);
+  return raw.subarray(off, off + node.size);
+}
+
+test("去额度横幅：结构化锚点容忍未知变量名漂移（v1 三元档位），幂等、可还原", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-quota-v1s-"));
+  const v = "QQzz", t = "TTrr";
+  const body = `function q(e){let r=e.ratio;return ${v}.ratio<=.1?\`model-very-low\`:${v}.ratio<=.2?\`model-low\`:${v}.ratio<=.5?\`model-half-used\`:null}if(${t}>.1||!ii||ee.isReminderHidden)u();`;
+  const original = padJs(body);
+  const root = makeFakeInstall(dir, [{ path: "out/renderer/assets/styles-aa.js", data: original }]);
+  const asar = path.join(root, "resources", "app.asar");
+  const entry = "out/renderer/assets/styles-aa.js";
+  const asarSizeBefore = fs.statSync(asar).size;
+
+  const applied = run(CLI, ["--quota-banner", root]);
+  assert.strictEqual(applied.status, 0, applied.stderr || applied.stdout);
+  const after = readTestAsarEntry(asar, entry);
+  assert.ok(after.includes(Buffer.from(`${v}.ratio<=-1?\`model-very-low\``)), "very-low 阈值未翻转");
+  assert.ok(after.includes(Buffer.from(`${v}.ratio<=-1?\`model-low\``)), "low 阈值未翻转");
+  assert.ok(after.includes(Buffer.from(`${v}.ratio<=-1?\`model-half-used\``)), "half-used 阈值未翻转");
+  assert.ok(after.includes(Buffer.from(`${t}>.1||!ii||ee.isReminderHidden`)), "v2 形态被误改");
+  assert.strictEqual(fs.statSync(asar).size, asarSizeBefore, "补丁改变了 asar 长度（应等长原地覆盖）");
+
+  const checked = run(CLI, ["--quota-banner", "--check", root]);
+  assert.ok(/已打 \| 锚点组: v1 结构化/.test(checked.stdout), "--check 未识别结构化形态为已打:\n" + checked.stdout);
+
+  const again = run(CLI, ["--quota-banner", root]);
+  assert.ok(/已打（v1 结构化.*），跳过/.test(again.stdout), "重复打未走幂等跳过");
+
+  const reverted = run(CLI, ["--quota-banner", "--revert", root]);
+  assert.strictEqual(reverted.status, 0, reverted.stderr || reverted.stdout);
+  assert.ok(readTestAsarEntry(asar, entry).equals(original), "还原后与原始内容不一致");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("去额度横幅：结构化锚点容忍未知变量名漂移（v2 提醒式），幂等、可还原", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-quota-v2s-"));
+  const body = "if(!(r===null||r<=0||TT>.1||!ii||ee.isReminderHidden?.(i,t)))u();";
+  const original = padJs(body);
+  const root = makeFakeInstall(dir, [{ path: "out/renderer/assets/styles-bb.js", data: original }]);
+  const asar = path.join(root, "resources", "app.asar");
+  const entry = "out/renderer/assets/styles-bb.js";
+  const asarSizeBefore = fs.statSync(asar).size;
+
+  const applied = run(CLI, ["--quota-banner", root]);
+  assert.strictEqual(applied.status, 0, applied.stderr || applied.stdout);
+  const after = readTestAsarEntry(asar, entry);
+  assert.ok(after.includes(Buffer.from("TT>-1||!ii||ee.isReminderHidden")), "提醒阈值未翻转");
+  assert.strictEqual(fs.statSync(asar).size, asarSizeBefore, "补丁改变了 asar 长度（应等长原地覆盖）");
+
+  const checked = run(CLI, ["--quota-banner", "--check", root]);
+  assert.ok(/已打 \| 锚点组: v2 结构化/.test(checked.stdout), "--check 未识别 v2 结构化已打:\n" + checked.stdout);
+
+  const reverted = run(CLI, ["--quota-banner", "--revert", root]);
+  assert.strictEqual(reverted.status, 0, reverted.stderr || reverted.stdout);
+  assert.ok(readTestAsarEntry(asar, entry).equals(original), "还原后与原始内容不一致");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("模型菜单加宽：结构化锚点容忍默认宽变量名漂移，幂等、可还原", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-menu-s-"));
+  const w = "ZQy";
+  const body = `const cls = ${w}??\`w-max min-w-[min(12rem,var(--radix-dropdown-menu-content-available-width))] max-w-(--radix-dropdown-menu-content-available-width)\`;const narrow = \`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)\`;`;
+  const original = padJs(body);
+  const root = makeFakeInstall(dir, [{ path: "out/renderer/assets/styles-cc.js", data: original }]);
+  const asar = path.join(root, "resources", "app.asar");
+  const entry = "out/renderer/assets/styles-cc.js";
+  const asarSizeBefore = fs.statSync(asar).size;
+
+  const applied = run(CLI, ["--menu-width", root]);
+  assert.strictEqual(applied.status, 0, applied.stderr || applied.stdout);
+  const after = readTestAsarEntry(asar, entry);
+  assert.ok(after.includes(Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`")), "点②未加宽");
+  assert.ok(after.includes(Buffer.from(`${w}??\`w-max`)), "点① native 形态被误改");
+  assert.strictEqual(fs.statSync(asar).size, asarSizeBefore, "补丁改变了 asar 长度（应等长原地覆盖）");
+
+  const checked = run(CLI, ["--menu-width", "--check", root]);
+  assert.ok(/已打 \| 锚点组: 结构化/.test(checked.stdout), "--check 未识别结构化组已打:\n" + checked.stdout);
+
+  const again = run(CLI, ["--menu-width", root]);
+  assert.ok(/已打（结构化.*），跳过/.test(again.stdout), "重复打未走幂等跳过");
+
+  const reverted = run(CLI, ["--menu-width", "--revert", root]);
+  assert.strictEqual(reverted.status, 0, reverted.stderr || reverted.stdout);
+  assert.ok(readTestAsarEntry(asar, entry).equals(original), "还原后与原始内容不一致");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("模型拉取：V8 锚点组（3.17 $Kn/xR）端到端 apply/check/revert 幂等往返", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-mh-v8-"));
+  const root = makeFakeInstall(dir, []);
+  const asar = path.join(root, "resources", "app.asar");
+  // 合成 3.17 形态：preload 第四代 witness（i→r）、renderer V8 组件 $Kn/xR、HDR 锚点链
+  const preload = Buffer.from(
+    'exposeInMainWorld("zcode",{connectRemote:s((t,n,r)=>S.ipcRenderer.invoke(v.ConnectRemote,{target:t,requestId:n,...r||{}}),"connectRemote")});',
+    "utf8");
+  const main = Buffer.from("const boot=1;\n", "utf8");
+  const rendBody = [
+    "const X=`button`;",
+    "const f={formatMessage:()=>({})};",
+    "const xR=(e)=>e.providerName;",
+    "function $Kn({providerId:e,providerName:t,providerEnabled:n=!0,providerAccess:r,models:i,onTestModel:a,onModelCommit:o,onModelEnabledChange:s,onDeleteModel:c,onAddModel:l,onReorderModelIds:u,settingsRevision:d=0}){return null}",
+    "function ModelSection(e){let w=`openai`,E=`https://x`,O=`k`;",
+    "return (0,$.jsxs)(`div`,{children:[(0,$.jsx)(`span`,{children:f.formatMessage({id:`settings.modelProvider.models`})}),(0,$.jsxs)(X,{type:`button`,children:`add`}),(0,$.jsx)($Kn,{providerId:e.providerId,providerName:xR(e),providerEnabled:e.enabled})]})}",
+    "",
+  ].join("\n");
+  const rend = padJs(rendBody);
+  // 重建 asar：preload + main + renderer 三条目
+  fs.rmSync(asar, { force: true });
+  makeTestAsar(asar, [
+    { path: "out/preload/index.cjs", data: preload },
+    { path: "out/main/index.js", data: main },
+    { path: "out/renderer/assets/styles-v8.js", data: rend },
+  ]);
+  const asarSizeBefore = fs.statSync(asar).size;
+
+  const applied = run(CLI, ["--modelhub", root]);
+  assert.strictEqual(applied.status, 0, applied.stderr || applied.stdout);
+  assert.ok(/模型拉取补丁注入完成/.test(applied.stdout), "apply 未成功:\n" + applied.stdout);
+
+  const checked = run(CLI, ["--modelhub", "--check", root]);
+  assert.ok(/已打/.test(checked.stdout), "--check 未报告已打:\n" + checked.stdout);
+  assert.ok(/锚点组 v8/.test(checked.stdout), "--check 未识别 V8 锚点组:\n" + checked.stdout);
+
+  const again = run(CLI, ["--modelhub", root]);
+  assert.ok(/已打模型拉取补丁/.test(again.stdout), "重复打未走幂等跳过:\n" + again.stdout);
+
+  // renderer 三点注入形态校验：签名/传参/头部按钮都已进入
+  const raw = fs.readFileSync(asar);
+  assert.ok(raw.includes(Buffer.from("mhEndpoint:__mhEp", "utf8")), "签名缺 mhEndpoint 形参");
+  assert.ok(raw.includes(Buffer.from("mhEndpoint:{apiType:w,baseUrl:E,apiKey:O},", "utf8")), "调用点缺端点传参");
+  assert.ok(raw.includes(Buffer.from("拉取模型", "utf8")), "头部缺拉取按钮");
+  assert.ok(fs.statSync(asar).size > asarSizeBefore, "重打包后尺寸应增长（新增注入块）");
+
+  const reverted = run(CLI, ["--modelhub", "--revert", root]);
+  assert.strictEqual(reverted.status, 0, reverted.stderr || reverted.stdout);
+  // 逐条目比对：三条目都应精确回到原始字节
+  const rd = (p) => readTestAsarEntry(asar, p);
+  assert.ok(rd("out/preload/index.cjs").equals(preload), "preload 还原不一致");
+  assert.ok(rd("out/main/index.js").equals(main), "main 还原不一致");
+  assert.ok(rd("out/renderer/assets/styles-v8.js").equals(rend), "renderer 还原不一致");
+  assert.ok(!fs.existsSync(asar + ".modelhub-patch.json"), "revert 后 sidecar 未清理");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("--doctor --json 在合成安装上输出合法 JSON 汇总（退出码语义）", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-doctor-"));
+  const root = path.join(dir, "ZCode.app", "Contents");
+  fs.mkdirSync(path.join(root, "resources", "glm"), { recursive: true });
+  fs.writeFileSync(path.join(root, "resources", "glm", "zcode.cjs"),
+    'module.exports=[["3009",{code:as.ModelRateLimited,reason:bs.RateLimited,retryReason:tl.RateLimited,retryable:!1}]];');
+
+  const r = run(CLI, ["--doctor", "--json", root]);
+  assert.strictEqual(r.status, 2, "缺 asar（存在未知项）时退出码应为 2");
+  const data = JSON.parse(r.stdout);
+  assert.strictEqual(data.zcode_patcher_doctor, 1, "缺少报告标记");
+  assert.ok(Array.isArray(data.rows) && data.rows.length === 10, "rows 应为 10 项");
+  const byName = Object.fromEntries(data.rows.map((x) => [x.name, x]));
+  assert.strictEqual(byName["模型 3009 重试"].state, "not", "3009 锚点存在应为未打");
+  assert.strictEqual(byName["思考等级透传"].state, "na", "无锚点应为不适用");
+  assert.strictEqual(byName["去额度骚扰横幅"].state, "unknown", "缺 asar 的项应为未知");
+  assert.ok(data.summary.unknown >= 1 && data.summary.na === 1, "汇总计数不正确");
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

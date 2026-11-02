@@ -144,11 +144,14 @@ func main() {
 	// Entry selection:
 	//   - bare invocation (no args)            -> interactive patch menu
 	//   - --status / --check-all               -> non-interactive status text
+	//   - --doctor（含 --doctor --json）        -> CLI 体检（--json 在此语境归 doctor，不归 TUI）
 	//   - any other flags / a target path      -> CLI (zcode-patcher.js)
 	var entry string
 	switch {
 	case len(os.Args) <= 1:
 		entry = filepath.Join(unpackDir, "zcode-tui.js") // interactive menu
+	case hasArg(os.Args[1:], "--doctor"):
+		entry = filepath.Join(unpackDir, "zcode-patcher.js") // doctor 体检走 CLI
 	case isStatusArg(os.Args[1:]):
 		entry = filepath.Join(unpackDir, "zcode-tui.js") // status report
 	default:
@@ -176,6 +179,15 @@ func isStatusArg(args []string) bool {
 	for _, a := range args {
 		switch a {
 		case "--status", "--check-all", "--apply-all", "--revert-all", "--json":
+			return true
+		}
+	}
+	return false
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
 			return true
 		}
 	}

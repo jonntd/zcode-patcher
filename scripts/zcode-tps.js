@@ -367,23 +367,45 @@
           border: "1px solid var(--color-border, transparent)",
           padding: "0 12px",
         });
-        // 挂到中组容器末尾；✨ 存在时保持 [✨, 胶囊] 顺序。
-        // 新版工具栏是 popover 触发器组（data-chat-toolbar-popover-trigger），旧版是「完全访问 ▾」，
-        // 都找不到时插到行首按钮组后面（row.children[1]），不影响发送按钮。
-        let mid = null;
-        for (const el of row.children) {
-          const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
-            || el.querySelector("[data-testid*='toolbar'],[data-testid*='send']");
-          if ((el.textContent || "").includes("完全访问") || isToolbarGroup) { mid = el; break; }
-        }
-        if (!mid) {
-          row.insertBefore(host, row.children[1] || null);
+        // 位置：跟随「继续按钮/✨」（ZCodium 布局 [✨ » 胶囊]，三者同挂左下 leading
+        // actions）；两者都不在时落左组末尾；再找不到才落旧的中组（右组），功能不消失。
+        const cont = row.querySelector("#zcode-continue-btn") || row.querySelector("#zcode-enhance-btn");
+        const lead = (function () {
+          const mode = document.querySelector("[data-testid='chat-mode-select-trigger']");
+          if (mode && row.contains(mode)) {
+            let n = mode;
+            while (n.parentElement && n.parentElement !== row) n = n.parentElement;
+            if (n.parentElement === row && !n.querySelector("[data-testid*='send'],[data-chat-toolbar-popover-trigger='true']")) return n;
+          }
+          let left = null;
+          for (const el of row.children) {
+            if (el.querySelector("[data-testid*='send'],[data-chat-toolbar-popover-trigger='true']")) break;
+            if (el.querySelector("button,[role='button']")) left = el;
+          }
+          return left;
+        })();
+        if (cont && cont.parentElement && !cont.parentElement.querySelector("[data-testid*='send']")) {
+          if (cont.nextSibling !== host) cont.parentElement.insertBefore(host, cont.nextSibling);
+        } else if (lead) {
+          if (host.parentNode !== lead) lead.appendChild(host);
         } else {
-          const enh = mid.querySelector("#zcode-enhance-btn");
-          if (enh) {
-            if (enh.nextSibling !== host) mid.insertBefore(host, enh.nextSibling);
-          } else if (host.parentNode !== mid && !mid.querySelector("[data-ztps-bar]")) {
-            mid.appendChild(host);
+          // 旧版中组：popover 触发器组（data-chat-toolbar-popover-trigger）或「完全访问 ▾」，
+          // 都找不到时插到行首按钮组后面（row.children[1]），不影响发送按钮。
+          let mid = null;
+          for (const el of row.children) {
+            const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
+              || el.querySelector("[data-testid*='toolbar'],[data-testid*='send']");
+            if ((el.textContent || "").includes("完全访问") || isToolbarGroup) { mid = el; break; }
+          }
+          if (!mid) {
+            row.insertBefore(host, row.children[1] || null);
+          } else {
+            const enh = mid.querySelector("#zcode-enhance-btn");
+            if (enh) {
+              if (enh.nextSibling !== host) mid.insertBefore(host, enh.nextSibling);
+            } else if (host.parentNode !== mid && !mid.querySelector("[data-ztps-bar]")) {
+              mid.appendChild(host);
+            }
           }
         }
       }

@@ -106,6 +106,34 @@
     return document.querySelector(".chat-composer-input-surface textarea,.chat-composer-input-surface [contenteditable='true'],[data-testid='chat-input'],[data-testid='v4-composer-input']");
   }
 
+  // 左下 leading actions 组（ZCodium 原生版布局：模式选择 + ✨ + » + 统计胶囊）。
+  // 3.17+ 单容器化后用模式触发器（变更前确认）定位：从触发器向上爬到 toolbar row 的
+  // 直接子级；老版本回落「右组（send/popover）之前最后一个按钮容器」；都找不到返回
+  // null，调用方走旧的中组（右组）兜底——功能绝不因结构改版消失。
+  function findLeadingGroup(row) {
+    const mode = document.querySelector("[data-testid='chat-mode-select-trigger']");
+    if (mode && row.contains(mode)) {
+      let n = mode;
+      while (n.parentElement && n.parentElement !== row) n = n.parentElement;
+      if (n.parentElement === row && !n.querySelector("[data-testid*='send'],[data-chat-toolbar-popover-trigger='true']")) return n;
+    }
+    let left = null;
+    for (const el of row.children) {
+      if (el.querySelector("[data-testid*='send'],[data-chat-toolbar-popover-trigger='true']")) break;
+      if (el.querySelector("button,[role='button']")) left = el;
+    }
+    return left;
+  }
+
+  // 会话当前模型原文（模型选择器按钮文本，如「GLM-5.3-Flash最高」）。主进程按前缀
+  // 最长匹配选中渠道的模型 id，增强跟随会话模型（ZCodium promptAssist 同语义）。
+  function currentModelText() {
+    try {
+      const el = document.querySelector("[data-testid='chat-model-select-trigger']");
+      return el ? String(el.textContent || "").trim() : "";
+    } catch (err) { return ""; }
+  }
+
   function readDraft() {
     const el = composerEl();
     if (!el) return "";
@@ -523,7 +551,7 @@
     try { data = await window.zcode.enhanceListModels(); } catch (err) { data = { ok: false, error: String(err) }; }
     loading.remove();
     if (!data || !data.ok) { addGroup("读取失败：" + ((data && data.error) || "未知错误")); return; }
-    // 指定的渠道不在启用渠道列表（被删/禁用/属 builtin: 官方渠道——主进程不列出）即清掉，恢复自动评分链
+    // 指定的渠道不在列表（被删/禁用）即清掉，恢复自动评分链
     if (sel && data.channels && !data.channels.some((c) => c.id === sel.channel)) {
       setSel(null);
       toast("已清除失效指定（" + sel.channel + "），恢复自动评分链", true);
@@ -534,6 +562,7 @@
     if (!data.channels.length) { addGroup("config.json 里没有启用的渠道"); return; }
     for (const ch of data.channels) {
       const badges = [ch.kind || "?"];
+      if (ch.builtin) badges.push("官方");
       if (ch.selected) badges.push("★ 当前渠道");
       if (!ch.hasKey) badges.push("无凭据");
       addGroup(ch.id + "　" + badges.join(" · "));
@@ -569,7 +598,7 @@
     const sel = getSel();
     let res = null;
     try {
-      res = await window.zcode.enhancePromptDraft(text, getMode(), sel ? sel.channel : undefined, sel ? sel.model : undefined);
+      res = await window.zcode.enhancePromptDraft(text, getMode(), sel ? sel.channel : undefined, sel ? sel.model : undefined, currentModelText());
     } catch (err) { res = { ok: false, error: String(err) }; }
     setBusy(btn, false);
     if (!res || !res.ok || !res.text) {
@@ -597,25 +626,34 @@
         if (existing) existing.remove();
         return;
       }
-      // 中组容器 = row 直接子级中含「完全访问」（旧版）或新版 tool 触发器按钮组
-      let mid = null;
-      for (const el of row.children) {
-        const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
-          || el.querySelector("[data-testid*='toolbar'],[data-testid*='send']");
-        if ((el.textContent || "").includes("完全访问") || isToolbarGroup) { mid = el; break; }
-      }
       if (!existing) existing = makeBtn();
-      if (mid) {
-        const pill = mid.querySelector("[data-ztps-bar]");
-        if (pill) {
-          // 已在胶囊之前即可（与胶囊之间允许隔着「继续」按钮）——不再强制紧邻，
-          // 否则会与 zcode-continue-btn 互相搬移形成抖动
-          if (!(existing.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-            mid.insertBefore(existing, pill);
-          }
-        } else if (existing.parentNode !== mid) mid.appendChild(existing);
-      } else if (existing.parentNode !== row) {
-        row.insertBefore(existing, row.firstChild);
+      // 位置：左下 leading actions（ZCodium 布局：模式选择旁），排到继续按钮/统计胶囊
+      // 之前保证 [✨ » 胶囊] 顺序；找不到左组才落旧的中组（右组），功能不消失。
+      const lead = findLeadingGroup(row);
+      if (lead) {
+        const anchor = lead.querySelector("#zcode-continue-btn") || lead.querySelector("[data-ztps-bar]");
+        if (anchor && anchor.previousSibling !== existing) lead.insertBefore(existing, anchor);
+        else if (!anchor && existing.parentNode !== lead) lead.appendChild(existing);
+      } else {
+        // 中组容器 = row 直接子级中含「完全访问」（旧版）或新版 tool 触发器按钮组
+        let mid = null;
+        for (const el of row.children) {
+          const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
+            || el.querySelector("[data-testid*='toolbar'],[data-testid*='send']");
+          if ((el.textContent || "").includes("完全访问") || isToolbarGroup) { mid = el; break; }
+        }
+        if (mid) {
+          const pill = mid.querySelector("[data-ztps-bar]");
+          if (pill) {
+            // 已在胶囊之前即可（与胶囊之间允许隔着「继续」按钮）——不再强制紧邻，
+            // 否则会与 zcode-continue-btn 互相搬移形成抖动
+            if (!(existing.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+              mid.insertBefore(existing, pill);
+            }
+          } else if (existing.parentNode !== mid) mid.appendChild(existing);
+        } else if (existing.parentNode !== row) {
+          row.insertBefore(existing, row.firstChild);
+        }
       }
     } catch (err) { /* 静默 */ }
   }

@@ -382,6 +382,35 @@
         if (existing) existing.remove();
         return;
       }
+      // 位置：跟随 ✨（ZCodium 布局 [✨ » 胶囊]），✨ 不在时落左下 leading actions 末尾，
+      // 都找不到才落旧的中组（右组）——功能绝不因结构改版消失。
+      const enh = row.querySelector("#zcode-enhance-btn");
+      const lead = (function () {
+        const mode = document.querySelector("[data-testid='chat-mode-select-trigger']");
+        if (mode && row.contains(mode)) {
+          let n = mode;
+          while (n.parentElement && n.parentElement !== row) n = n.parentElement;
+          if (n.parentElement === row && !n.querySelector("[data-testid*='send'],[data-chat-toolbar-popover-trigger='true']")) return n;
+        }
+        let left = null;
+        for (const el of row.children) {
+          if (el.querySelector("[data-testid*='send'],[data-chat-toolbar-popover-trigger='true']")) break;
+          if (el.querySelector("button,[role='button']")) left = el;
+        }
+        return left;
+      })();
+      if (enh && enh.parentElement && !enh.parentElement.querySelector("[data-testid*='send']")) {
+        if (!existing) existing = makeBtn();
+        if (enh.nextSibling !== existing) enh.parentElement.insertBefore(existing, enh.nextSibling);
+        return;
+      }
+      if (lead) {
+        if (!existing) existing = makeBtn();
+        const tps = lead.querySelector("[data-ztps-bar]");
+        if (tps && tps.previousSibling !== existing) lead.insertBefore(existing, tps);
+        else if (!tps && existing.parentNode !== lead) lead.appendChild(existing);
+        return;
+      }
       let mid = null;
       for (const el of row.children) {
         const isToolbarGroup = el.querySelector("[data-chat-toolbar-popover-trigger='true']")
@@ -390,7 +419,6 @@
       }
       if (!mid) return;
       if (!existing) existing = makeBtn();
-      const enh = mid.querySelector("#zcode-enhance-btn");
       if (enh) {
         if (enh.nextSibling !== existing) mid.insertBefore(existing, enh.nextSibling);
       } else if (existing.parentNode !== mid) {

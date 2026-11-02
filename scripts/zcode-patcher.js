@@ -896,6 +896,93 @@ function processUsageChart(asar, checkOnly, revert) {
   }
 }
 
+// ---------------------------------------------------------------- 结构化锚点兜底（asar 渲染层）
+
+// 字面变体组之外的第二道识别层：压缩器历来只改符号名不改结构，字面组全部失配时
+// 按结构正则捕获实际变量名、动态合成等长替换串——纯改名类版本漂移零适配自动命中。
+// 与内核侧 editall 的结构化兜底同一纪律：每组每点恰在唯一文件中唯一命中才动手；
+// 只做字面组的兜底，绝不改写字面组（多版本安装共存靠这个）。
+// 结构点三种形态：
+//   改写点  { desc, oldRe, patchedRe, build, buildFromPatched }
+//           build(捕获变量数组) -> {old,new}（等长字符串，构建后再校验一次）
+//   检测点  { desc, native: true, nativeRe }   只检测不改写（如官方已原生自适应的形态）
+
+function reEscape(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/** latin1 视图上跑结构正则（补丁点均为纯 ASCII，1:1 字节往返无损）；每次新建 g 标志副本。 */
+function structMatches(text, re) {
+  const r = new RegExp(re.source, "g");
+  const out = [];
+  let m;
+  while ((m = r.exec(text)) !== null) {
+    out.push(m);
+    if (m.index === r.lastIndex) r.lastIndex++;
+  }
+  return out;
+}
+
+/** 解析单个结构化补丁点：恰唯一命中（原始/已打/native 形态之一）才返回统一条目
+ *  {desc, kind, pos, old, new}；计数异常返回 {kind:"bad"}；未命中返回 null。 */
+function resolveStructuralPoint(p, bytes, text) {
+  if (p.native) {
+    if (p.nativeRe) {
+      const m = structMatches(text, p.nativeRe);
+      return m.length === 1
+        ? { desc: p.desc, kind: "native", pos: m[0].index, re: p.nativeRe }
+        : m.length ? { desc: p.desc, kind: "bad" } : null;
+    }
+    const o = countBytes(bytes, p.pattern);
+    return o === 1
+      ? { desc: p.desc, kind: "native", pos: bytes.indexOf(p.pattern), old: p.pattern }
+      : o ? { desc: p.desc, kind: "bad" } : null;
+  }
+  if (p.oldRe) {
+    const olds = structMatches(text, p.oldRe);
+    const pats = p.patchedRe ? structMatches(text, p.patchedRe) : [];
+    const built = (fn, caps, at) => {
+      const b = fn(caps);
+      if (!b || Buffer.byteLength(b.old, "utf8") !== Buffer.byteLength(b.new, "utf8")) return null;
+      return { desc: p.desc, kind: at, pos: at === "orig" ? olds[0].index : pats[0].index,
+        old: Buffer.from(b.old, "utf8"), new: Buffer.from(b.new, "utf8") };
+    };
+    if (olds.length === 1 && pats.length === 0) return built(p.build, olds[0].slice(1), "orig");
+    if (olds.length === 0 && pats.length === 1 && p.buildFromPatched) return built(p.buildFromPatched, pats[0].slice(1), "patched");
+    return (olds.length || pats.length) ? { desc: p.desc, kind: "bad" } : null;
+  }
+  // 字面点（结构组允许混排字面锚点，如 menu 结构组的点②）：语义与字面变体组一致
+  if (p.pattern) {
+    const o = countBytes(bytes, p.pattern);
+    const n = p.replacement ? countBytes(bytes, p.replacement) : 0;
+    if (o === 1 && n === 0) return { desc: p.desc, kind: "orig", pos: bytes.indexOf(p.pattern), old: p.pattern, new: p.replacement };
+    if (o === 0 && n === 1) return { desc: p.desc, kind: "patched", pos: bytes.indexOf(p.replacement), old: p.pattern, new: p.replacement };
+    return (o || n) ? { desc: p.desc, kind: "bad" } : null;
+  }
+  return null;
+}
+
+/** 字面变体组全部失配时的结构化兜底：依次解析结构化变体组。
+ *  组成立条件：组内每点在候选文件中各自恰唯一命中且全部落在同一文件，且这样的文件
+ *  恰有一个（多个 = 歧义，静默跳过该组，与字面组选择语义一致）。
+ *  命中返回 { label, file: {path, ent, bytes}, items }，全部失配返回 null。 */
+function resolveStructuralGroups(groups, candidates) {
+  for (const g of groups) {
+    const hits = [];
+    for (const c of candidates) {
+      const text = c.bytes.toString("latin1");
+      const items = [];
+      let healthy = true;
+      for (const p of g.patches) {
+        const it = resolveStructuralPoint(p, c.bytes, text);
+        if (!it || it.kind === "bad") { healthy = false; break; }
+        items.push(it);
+      }
+      if (healthy) hits.push({ file: c, items });
+    }
+    if (hits.length === 1) return { label: g.label, file: hits[0].file, items: hits[0].items };
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- 模型菜单加宽
 
 // 供应商子菜单两档固定宽度类 → w-96（384px）。等长字节原地覆盖：w-48/w-40 与 w-96 同为 4 字节，
@@ -935,6 +1022,28 @@ for (const v of MENU_WIDTH_VARIANTS) {
   }
 }
 
+// 结构化兜底组（字面 v1–v3 全部失配时尝试）：点①的默认宽变量名（j→N 已漂移过）按
+// 结构捕获、只检测不改写；点②是纯类名字面串（无混淆符号），保持字面改写。
+// v1 旧版固定宽形态不加结构组——旧内核已冻结不会再生漂移，而 ``X??`w-48` `` 这类
+// 短模式在大 bundle 里唯一性不足，宁可不识别也不盲改。
+const MENU_STRUCT_GROUPS = [
+  {
+    label: "结构化（w-max 自适应，默认宽变量自适应）",
+    patches: [
+      {
+        desc: "子菜单默认宽：官方已原生自适应（w-max），无需改写",
+        native: true,
+        nativeRe: new RegExp("(\\w+)\\?\\?" + reEscape("`w-max min-w-[min(12rem,var(--radix-dropdown-menu-content-available-width))] max-w-(--radix-dropdown-menu-content-available-width)`")),
+      },
+      {
+        desc: "自定义渠道子菜单 w-40(160px)→w-96(384px)，保留视口钳制",
+        pattern: Buffer.from("`w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"),
+        replacement: Buffer.from("`w-96 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)`", "utf8"),
+      },
+    ],
+  },
+];
+
 function processMenuWidth(asar, checkOnly, revert) {
   const side = asar + ".menuwidth-patch.json";
   const asarSize = fs.statSync(asar).size;
@@ -948,9 +1057,7 @@ function processMenuWidth(asar, checkOnly, revert) {
     if (!p.startsWith("out/renderer/assets/") || !p.endsWith(".js") || ent.size < 100000) continue;
     candidates.push({ path: p, ent, bytes: entryBytes(state, ent) });
   }
-  let variant = null;
-  let hit = null;
-  let kinds = null;
+  let picked = null;
   for (const v of MENU_WIDTH_VARIANTS) {
     const h = candidates.filter((c) => v.patches.every((it) => {
       const o = countBytes(c.bytes, it.pattern);
@@ -958,28 +1065,37 @@ function processMenuWidth(asar, checkOnly, revert) {
       return it.native ? o === 1 : o + n > 0;
     }));
     if (h.length !== 1) continue;
-    const st = v.patches.map((it) => {
-      const o = countBytes(h[0].bytes, it.pattern);
-      const n = it.replacement ? countBytes(h[0].bytes, it.replacement) : 0;
-      return it.native ? (o === 1 ? "native" : "bad")
+    const c = h[0];
+    const items = v.patches.map((it) => {
+      const o = countBytes(c.bytes, it.pattern);
+      const n = it.replacement ? countBytes(c.bytes, it.replacement) : 0;
+      const kind = it.native ? (o === 1 ? "native" : "bad")
         : o === 1 && n === 0 ? "orig"
         : o === 0 && n === 1 ? "patched"
         : "bad";
+      return { desc: it.desc, kind, lit: true,
+        pos: kind === "patched" ? c.bytes.indexOf(it.replacement) : c.bytes.indexOf(it.pattern),
+        old: it.pattern, new: it.replacement };
     });
-    variant = v; hit = h[0]; kinds = st;
+    picked = { label: v.label, rel: c.path, ent: c.ent, items };
     break;
   }
-  if (!variant) {
+  // 字面组全部失配 → 结构化兜底（纯改名类漂移零适配自动命中）
+  if (!picked) {
+    const res = resolveStructuralGroups(MENU_STRUCT_GROUPS, candidates);
+    if (res) picked = { label: res.label, rel: res.file.path, ent: res.file.ent, items: res.items };
+  }
+  if (!picked) {
     console.log(`[!] ${asar}\n    模型菜单锚点未在任何锚点组唯一命中（期望 1 个文件），版本结构可能已变，跳过`);
     return;
   }
-  const { path: rel, ent } = hit;
+  const { rel, ent, items } = picked;
   const fname = rel.split("/").pop();
   const absOff = state.dataStart + Number(ent.offset);
-  const patchedCnt = kinds.filter((k) => k === "patched").length;
-  const nativeCnt = kinds.filter((k) => k === "native").length;
-  const badCnt = kinds.filter((k) => k === "bad").length;
-  const total = variant.patches.length;
+  const patchedCnt = items.filter((k) => k.kind === "patched").length;
+  const nativeCnt = items.filter((k) => k.kind === "native").length;
+  const badCnt = items.filter((k) => k.kind === "bad").length;
+  const total = items.length;
   const satisfied = patchedCnt + nativeCnt;
 
   if (checkOnly) {
@@ -989,7 +1105,7 @@ function processMenuWidth(asar, checkOnly, revert) {
       : `不完整（${patchedCnt}/${total - nativeCnt}）`;
     let sideOk = false;
     try { sideOk = fs.existsSync(side) && readJson(side).asar_size === asarSize; } catch { sideOk = false; }
-    console.log(`[*] ${asar}\n    模型菜单加宽: ${st} | 锚点组: ${variant.label} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
+    console.log(`[*] ${asar}\n    模型菜单加宽: ${st} | 锚点组: ${picked.label} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
     return;
   }
 
@@ -1006,10 +1122,9 @@ function processMenuWidth(asar, checkOnly, revert) {
     const fd = fs.openSync(asar, "r+");
     let ok = 0;
     try {
-      for (let i = 0; i < total; i++) {
-        if (kinds[i] !== "patched") continue;
-        const it = variant.patches[i];
-        fs.writeSync(fd, it.pattern, 0, it.pattern.length, absOff + raw.indexOf(it.replacement));
+      for (const it of items) {
+        if (it.kind !== "patched") continue;
+        fs.writeSync(fd, it.old, 0, it.old.length, absOff + it.pos);
         ok++;
       }
     } finally {
@@ -1026,16 +1141,15 @@ function processMenuWidth(asar, checkOnly, revert) {
     return;
   }
   if (satisfied === total) {
-    console.log(`    [=] ${fname} | ${patchedCnt === 0 ? "官方已原生自适应，无需打" : "已打"}（${variant.label}），跳过`);
+    console.log(`    [=] ${fname} | ${patchedCnt === 0 ? "官方已原生自适应，无需打" : "已打"}（${picked.label}），跳过`);
     return;
   }
   const raw = Buffer.from(entryBytes(state, ent));
   const fd = fs.openSync(asar, "r+");
   try {
-    for (let i = 0; i < total; i++) {
-      if (kinds[i] !== "orig") continue;
-      const it = variant.patches[i];
-      fs.writeSync(fd, it.replacement, 0, it.replacement.length, absOff + raw.indexOf(it.pattern));
+    for (const it of items) {
+      if (it.kind !== "orig") continue;
+      fs.writeSync(fd, it.new, 0, it.new.length, absOff + it.pos);
       console.log(`    [+] ${fname} | ${it.desc}`);
     }
   } finally {
@@ -1046,11 +1160,13 @@ function processMenuWidth(asar, checkOnly, revert) {
   const ent2 = walkEntries(state2.header).find((x) => x.path === rel)?.ent;
   const back = ent2 ? entryBytes(state2, ent2) : Buffer.alloc(0);
   const okAll = back.length === ent.size
-    && variant.patches.every((it) => it.native
-      ? countBytes(back, it.pattern) === 1
-      : countBytes(back, it.replacement) === 1 && countBytes(back, it.pattern) === 0);
+    && items.every((it) => it.kind === "native"
+      ? (it.re ? structMatches(back.toString("latin1"), it.re).length === 1 : countBytes(back, it.old) === 1)
+      : it.lit
+        ? countBytes(back, it.new) === 1 && countBytes(back, it.old) === 0
+        : back.subarray(it.pos, it.pos + it.new.length).equals(it.new) && countBytes(back, it.old) === 0);
   if (!okAll) console.log(`    [!] 回读校验未通过，请 --menu-width --revert 还原后排查`);
-  writeJson(side, { asar_size: asarSize, path: rel, variant: variant.label, patches: variant.patches.map((it) => ({ desc: it.desc })) });
+  writeJson(side, { asar_size: asarSize, path: rel, variant: picked.label, patches: items.map((it) => ({ desc: it.desc })) });
   console.log(`    状态记录: ${path.basename(side)}${okAll ? "" : "（校验异常）"}`);
 }
 
@@ -1104,6 +1220,51 @@ for (const v of QUOTA_VARIANTS) {
   }
 }
 
+// 结构化兜底组（字面 v1/v2 全部失配时尝试）：阈值变量名按结构捕获、动态合成等长
+// 替换串（`.1`→`-1` 同为 2 字节，比例恒 ≥0 时 `<=-1` / `>-1` 永不命中）。标签串
+// `model-very-low` / `isReminderHidden` 为领域专属字符串，误命中风险可忽略；
+// 恰唯一命中才动手的纪律不变。
+const QUOTA_STRUCT_GROUPS = [
+  {
+    label: "v1 结构化（旧版三元档位，阈值变量自适应）",
+    patches: [
+      {
+        desc: "额度骚扰档 very-low(≤10%) 关闭",
+        oldRe: /(\w+)\.ratio<=\.1\?`model-very-low`/,
+        patchedRe: /(\w+)\.ratio<=-1\?`model-very-low`/,
+        build: (c) => ({ old: `${c[0]}.ratio<=.1?` + "`model-very-low`", new: `${c[0]}.ratio<=-1?` + "`model-very-low`" }),
+        buildFromPatched: (c) => ({ old: `${c[0]}.ratio<=.1?` + "`model-very-low`", new: `${c[0]}.ratio<=-1?` + "`model-very-low`" }),
+      },
+      {
+        desc: "额度骚扰档 low(≤20%) 关闭",
+        oldRe: /(\w+)\.ratio<=\.2\?`model-low`/,
+        patchedRe: /(\w+)\.ratio<=-1\?`model-low`/,
+        build: (c) => ({ old: `${c[0]}.ratio<=.2?` + "`model-low`", new: `${c[0]}.ratio<=-1?` + "`model-low`" }),
+        buildFromPatched: (c) => ({ old: `${c[0]}.ratio<=.2?` + "`model-low`", new: `${c[0]}.ratio<=-1?` + "`model-low`" }),
+      },
+      {
+        desc: "额度骚扰档 half-used(≤50%) 关闭",
+        oldRe: /(\w+)\.ratio<=\.5\?`model-half-used`/,
+        patchedRe: /(\w+)\.ratio<=-1\?`model-half-used`/,
+        build: (c) => ({ old: `${c[0]}.ratio<=.5?` + "`model-half-used`", new: `${c[0]}.ratio<=-1?` + "`model-half-used`" }),
+        buildFromPatched: (c) => ({ old: `${c[0]}.ratio<=.5?` + "`model-half-used`", new: `${c[0]}.ratio<=-1?` + "`model-half-used`" }),
+      },
+    ],
+  },
+  {
+    label: "v2 结构化（新版提醒式横幅，阈值变量自适应）",
+    patches: [
+      {
+        desc: "额度骚扰档 very-low(≤10%) 关闭",
+        oldRe: /(\w+)>\.1\|\|!(\w+)\|\|(\w+)\.isReminderHidden/,
+        patchedRe: /(\w+)>-1\|\|!(\w+)\|\|(\w+)\.isReminderHidden/,
+        build: (c) => ({ old: `${c[0]}>.1||!${c[1]}||${c[2]}.isReminderHidden`, new: `${c[0]}>-1||!${c[1]}||${c[2]}.isReminderHidden` }),
+        buildFromPatched: (c) => ({ old: `${c[0]}>.1||!${c[1]}||${c[2]}.isReminderHidden`, new: `${c[0]}>-1||!${c[1]}||${c[2]}.isReminderHidden` }),
+      },
+    ],
+  },
+];
+
 function processQuotaBanner(asar, checkOnly, revert) {
   const side = asar + ".quota-patch.json";
   const asarSize = fs.statSync(asar).size;
@@ -1116,33 +1277,42 @@ function processQuotaBanner(asar, checkOnly, revert) {
     candidates.push({ path: p, ent, bytes: entryBytes(state, ent) });
   }
 
-  // 版本组选择：依次探测 QUOTA_VARIANTS，取第一个有锚点命中的组；组内任一文件唯一，
-  // 且旧组在三元档位下必须三处全部锚定（组内计数校验在下方 kinds 里做）
-  let variant = null;
-  let hits = [];
+  // 版本组选择：依次探测字面变体组，取第一个唯一命中的组（组内任一文件唯一，
+  // 旧组在三元档位下必须三处全部锚定，组内计数校验在 items 里做）。
+  // 字面组全部失配 → 结构化兜底组（纯改名类漂移零适配自动命中）。
+  let picked = null;
   for (const v of QUOTA_VARIANTS) {
     const vhit = candidates.filter((c) => v.patches.some((it) =>
       countBytes(c.bytes, it.pattern) > 0 || countBytes(c.bytes, it.replacement) > 0));
-    if (vhit.length === 1) {
-      variant = v;
-      hits = vhit;
-      break;
-    }
+    if (vhit.length !== 1) continue;
+    const c = vhit[0];
+    const items = v.patches.map((it) => {
+      const o = countBytes(c.bytes, it.pattern);
+      const n = countBytes(c.bytes, it.replacement);
+      const kind = o === 1 && n === 0 ? "orig"
+        : o === 0 && n === 1 ? "patched"
+        : "bad";
+      return { desc: it.desc, kind, lit: true,
+        pos: kind === "patched" ? c.bytes.indexOf(it.replacement) : c.bytes.indexOf(it.pattern),
+        old: it.pattern, new: it.replacement };
+    });
+    picked = { label: v.label, rel: c.path, ent: c.ent, items };
+    break;
   }
-  if (!variant) {
+  if (!picked) {
+    const res = resolveStructuralGroups(QUOTA_STRUCT_GROUPS, candidates);
+    if (res) picked = { label: res.label, rel: res.file.path, ent: res.file.ent, items: res.items };
+  }
+  if (!picked) {
     console.log(`[!] ${asar}\n    额度横幅锚点未在任何锚点组唯一命中（期望 1 个文件），版本结构可能已变，跳过`);
     return;
   }
-  const { path: rel, bytes } = hits[0];
+  const { rel, ent, items } = picked;
   const fname = rel.split("/").pop();
-  const absOff = state.dataStart + Number(hits[0].ent.offset);
-  const kinds = variant.patches.map((it) =>
-    countBytes(bytes, it.pattern) === 1 && countBytes(bytes, it.replacement) === 0 ? "orig"
-      : countBytes(bytes, it.pattern) === 0 && countBytes(bytes, it.replacement) === 1 ? "patched"
-      : "bad");
-  const patchedCnt = kinds.filter((k) => k === "patched").length;
-  const badCnt = kinds.filter((k) => k === "bad").length;
-  const total = variant.patches.length;
+  const absOff = state.dataStart + Number(ent.offset);
+  const patchedCnt = items.filter((k) => k.kind === "patched").length;
+  const badCnt = items.filter((k) => k.kind === "bad").length;
+  const total = items.length;
 
   if (checkOnly) {
     const st = badCnt ? "锚点计数异常（拒绝操作）"
@@ -1151,7 +1321,7 @@ function processQuotaBanner(asar, checkOnly, revert) {
       : `不完整（${patchedCnt}/${total}）`;
     let sideOk = false;
     try { sideOk = fs.existsSync(side) && readJson(side).asar_size === asarSize; } catch { sideOk = false; }
-    console.log(`[*] ${asar}\n    去额度骚扰横幅: ${st} | 锚点组: ${variant.label} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
+    console.log(`[*] ${asar}\n    去额度骚扰横幅: ${st} | 锚点组: ${picked.label} | sidecar: ${sideOk ? "有" : "无"} | 渲染文件: ${fname}`);
     return;
   }
 
@@ -1164,14 +1334,13 @@ function processQuotaBanner(asar, checkOnly, revert) {
       console.log(`    [!] ${fname} | 锚点出现次数异常，拒绝盲改`);
       return;
     }
-    const raw = Buffer.from(entryBytes(state, hits[0].ent)); // 读后即拷：写入偏移全部基于该快照
+    const raw = Buffer.from(entryBytes(state, ent)); // 读后即拷：写入偏移全部基于该快照
     const fd = fs.openSync(asar, "r+");
     let ok = 0;
     try {
-      for (let i = 0; i < total; i++) {
-        if (kinds[i] !== "patched") continue;
-        const it = variant.patches[i];
-        fs.writeSync(fd, it.pattern, 0, it.pattern.length, absOff + raw.indexOf(it.replacement));
+      for (const it of items) {
+        if (it.kind !== "patched") continue;
+        fs.writeSync(fd, it.old, 0, it.old.length, absOff + it.pos);
         ok++;
       }
     } finally {
@@ -1188,16 +1357,15 @@ function processQuotaBanner(asar, checkOnly, revert) {
     return;
   }
   if (patchedCnt === total) {
-    console.log(`    [=] ${fname} | 已打（${variant.label}），跳过`);
+    console.log(`    [=] ${fname} | 已打（${picked.label}），跳过`);
     return;
   }
-  const raw = Buffer.from(entryBytes(state, hits[0].ent));
+  const raw = Buffer.from(entryBytes(state, ent));
   const fd = fs.openSync(asar, "r+");
   try {
-    for (let i = 0; i < total; i++) {
-      if (kinds[i] !== "orig") continue;
-      const it = variant.patches[i];
-      fs.writeSync(fd, it.replacement, 0, it.replacement.length, absOff + raw.indexOf(it.pattern));
+    for (const it of items) {
+      if (it.kind !== "orig") continue;
+      fs.writeSync(fd, it.new, 0, it.new.length, absOff + it.pos);
       console.log(`    [+] ${fname} | ${it.desc}`);
     }
   } finally {
@@ -1207,10 +1375,12 @@ function processQuotaBanner(asar, checkOnly, revert) {
   const state2 = asarOpen(asar);
   const ent2 = walkEntries(state2.header).find((x) => x.path === rel)?.ent;
   const back = ent2 ? entryBytes(state2, ent2) : Buffer.alloc(0);
-  const okAll = back.length === hits[0].ent.size
-    && variant.patches.every((it) => countBytes(back, it.replacement) === 1 && countBytes(back, it.pattern) === 0);
+  const okAll = back.length === ent.size
+    && items.every((it) => it.lit
+      ? countBytes(back, it.new) === 1 && countBytes(back, it.old) === 0
+      : back.subarray(it.pos, it.pos + it.new.length).equals(it.new) && countBytes(back, it.old) === 0);
   if (!okAll) console.log(`    [!] 回读校验未通过，请 --quota-banner --revert 还原后排查`);
-  writeJson(side, { asar_size: asarSize, path: rel, variant: variant.label, patches: variant.patches.map((it) => ({ desc: it.desc })) });
+  writeJson(side, { asar_size: asarSize, path: rel, variant: picked.label, patches: items.map((it) => ({ desc: it.desc })) });
   console.log(`    状态记录: ${path.basename(side)}${okAll ? "" : "（校验异常）"}`);
 }
 
@@ -1515,6 +1685,10 @@ function processModelhub(asar, checkOnly, revert, mem) {
   const v7SigOld = ph.RENDER_V7_SIG_OLD ? Buffer.from(ph.RENDER_V7_SIG_OLD, "utf8") : null;
   const v7SigNew = ph.RENDER_V7_SIG_NEW ? Buffer.from(ph.RENDER_V7_SIG_NEW, "utf8") : null;
   const v7PropBuf = ph.RENDER_V7_INSERT ? Buffer.from(ph.RENDER_V7_INSERT, "utf8") : null;
+  const v8Buf = ph.RENDER_V8_ANCHOR ? Buffer.from(ph.RENDER_V8_ANCHOR, "utf8") : null;
+  const v8SigOld = ph.RENDER_V8_SIG_OLD ? Buffer.from(ph.RENDER_V8_SIG_OLD, "utf8") : null;
+  const v8SigNew = ph.RENDER_V8_SIG_NEW ? Buffer.from(ph.RENDER_V8_SIG_NEW, "utf8") : null;
+  const v8PropBuf = ph.RENDER_V8_INSERT ? Buffer.from(ph.RENDER_V8_INSERT, "utf8") : null;
   const v2HdrAnchor = ph.RENDER_V2_HDR_ANCHOR ? Buffer.from(ph.RENDER_V2_HDR_ANCHOR, "utf8") : null;
   const v2HdrInsert = ph.RENDER_V2_HDR_INSERT ? Buffer.from(ph.RENDER_V2_HDR_INSERT, "utf8") : null;
   // 旧版 v2（独立行按钮）整块注入串：仅为已打旧版的原地升级/还原保留
@@ -1553,6 +1727,7 @@ function processModelhub(asar, checkOnly, revert, mem) {
     { n: 5, buf: v5Buf, sigOld: v5SigOld, sigNew: v5SigNew, prop: v5PropBuf },
     { n: 6, buf: v6Buf, sigOld: v6SigOld, sigNew: v6SigNew, prop: v6PropBuf },
     { n: 7, buf: v7Buf, sigOld: v7SigOld, sigNew: v7SigNew, prop: v7PropBuf },
+    { n: 8, buf: v8Buf, sigOld: v8SigOld, sigNew: v8SigNew, prop: v8PropBuf },
   ];
   const found = [];
   mem.each((p, ent) => {
@@ -1604,10 +1779,13 @@ function processModelhub(asar, checkOnly, revert, mem) {
   const tagged = marks.filter(([rel, mark]) => mem.get(rel).includes(mark)).length;
 
   // preload 注入变体：原生 connectRemote 体的 ipcRenderer 绑定名随内核构建漂移
-  // （3.14 起压缩器把 h 改名为 _，3.16 起又改名 S；witness 串判版）。旧形态注入在新内核
-  // 上运行时 X.ipcRenderer 为 undefined（renderer 报「Cannot read properties of undefined
+  // （3.14 起压缩器把 h 改名为 _，3.16 起又改名 S；3.17 起 connectRemote 第三参 i→r 但绑定
+  // 仍为 S，故 V4 注入串与 V3 内容相同、仅 witness 判版不同）。旧形态注入在新内核上运行时
+  // X.ipcRenderer 为 undefined（renderer 报「Cannot read properties of undefined
   // (reading 'invoke')」），故按内核形态选注入串，漂移升级路径据此剥旧换新。
   const preForms = [
+    { witness: ph.PRELOAD_V4_WITNESS ? Buffer.from(ph.PRELOAD_V4_WITNESS, "utf8") : null,
+      inject: ph.PRELOAD_INJECT_V4 ? Buffer.from(ph.PRELOAD_INJECT_V4, "utf8") : null },
     { witness: ph.PRELOAD_V3_WITNESS ? Buffer.from(ph.PRELOAD_V3_WITNESS, "utf8") : null,
       inject: ph.PRELOAD_INJECT_V3 ? Buffer.from(ph.PRELOAD_INJECT_V3, "utf8") : null },
     { witness: ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null,
@@ -1649,10 +1827,10 @@ function processModelhub(asar, checkOnly, revert, mem) {
     // 还原用的三点注入字节：先按当前命中的锚点组（mode），再回落到其它变体——
     // 已打安装的 mode 探测基于「注入块是否在」的标记，与打补丁时的版本可能不同
     // （例如宿主升级后 sidecar 记录了旧版本，但注入仍在），故逐组尝试。
-    const sigNewCands = [sigNewBuf, v7SigNew, v6SigNew, v5SigNew, v4SigNew, v3SigNew, v2SigNew].filter(Boolean);
-    const sigOldCands = [sigOldBuf, v7SigOld, v6SigOld, v5SigOld, v4SigOld, v3SigOld, v2SigOld].filter(Boolean);
-    const callCands = [callAnchorBuf, v7Buf, v6Buf, v5Buf, v4Buf, v3Buf, v2Buf].filter(Boolean);
-    const propCands = [propBuf, v7PropBuf, v6PropBuf, v5PropBuf, v4PropBuf, v3PropBuf, v2PropBuf].filter(Boolean);
+    const sigNewCands = [sigNewBuf, v8SigNew, v7SigNew, v6SigNew, v5SigNew, v4SigNew, v3SigNew, v2SigNew].filter(Boolean);
+    const sigOldCands = [sigOldBuf, v8SigOld, v7SigOld, v6SigOld, v5SigOld, v4SigOld, v3SigOld, v2SigOld].filter(Boolean);
+    const callCands = [callAnchorBuf, v8Buf, v7Buf, v6Buf, v5Buf, v4Buf, v3Buf, v2Buf].filter(Boolean);
+    const propCands = [propBuf, v8PropBuf, v7PropBuf, v6PropBuf, v5PropBuf, v4PropBuf, v3PropBuf, v2PropBuf].filter(Boolean);
     const pickPair = (cur, newC, oldC) => {
       for (let i = 0; i < newC.length; i++) {
         if (countBytes(cur, newC[i]) === 1) {
@@ -1673,7 +1851,8 @@ function processModelhub(asar, checkOnly, revert, mem) {
       }
       let r = null;
       if (rel === MH_PRELOAD_REL) {
-        for (const inj of [preInjV1, preInjV2]) {
+        // 逐代注入串剥离（新版优先，旧版兜底）；V4 与 V3 内容相同，命中其一即可
+        for (const inj of preForms.map((f) => f.inject)) {
           if (!inj || countBytes(cur, inj) !== 1) continue;
           r = replaceOnce(cur, inj, Buffer.alloc(0));
           break;
@@ -2029,12 +2208,15 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
   // 该形态下必须用 V3 注入串，否则运行时 h.ipcRenderer 为 undefined（「reading 'invoke'」报错）。
   const injectV3 = ph.ENH_PRELOAD_INJECT_V3 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V3, "utf8") : null;
   const injectV4 = ph.ENH_PRELOAD_INJECT_V4 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V4, "utf8") : null;
+  const injectV5 = ph.ENH_PRELOAD_INJECT_V5 ? Buffer.from(ph.ENH_PRELOAD_INJECT_V5, "utf8") : null;
   const preWitness = ph.PRELOAD_V2_WITNESS ? Buffer.from(ph.PRELOAD_V2_WITNESS, "utf8") : null;
-  // 内核 preload 第 2/3 代形态见证（3.14 起原生 connectRemote 体的 ipcRenderer 绑定名 h→_，
-  // 3.16 起 _→S）：命中哪代 witness 就必须用对应代注入串，否则运行时 X.ipcRenderer 为
-  // undefined（「reading 'invoke'」报错）。
+  // 内核 preload 第 2/3/4 代形态见证（3.14 起原生 connectRemote 体的 ipcRenderer 绑定名 h→_，
+  // 3.16 起 _→S，3.17 起 connectRemote 第三参 i→r 而绑定仍 S）：命中哪代 witness 就必须用
+  // 对应代注入串，否则运行时 X.ipcRenderer 为 undefined（「reading 'invoke'」报错）。
   const preWitness3 = ph.PRELOAD_V3_WITNESS ? Buffer.from(ph.PRELOAD_V3_WITNESS, "utf8") : null;
-  const injCur = injectV4 && preWitness3 && preBuf.includes(preWitness3) ? injectV4
+  const preWitness4 = ph.PRELOAD_V4_WITNESS ? Buffer.from(ph.PRELOAD_V4_WITNESS, "utf8") : null;
+  const injCur = injectV5 && preWitness4 && preBuf.includes(preWitness4) ? injectV5
+    : injectV4 && preWitness3 && preBuf.includes(preWitness3) ? injectV4
     : injectV3 && preWitness && preBuf.includes(preWitness) ? injectV3 : injectNew;
   const preIsCurrent = preBuf.includes(injCur);
   const handlers = buildEnhanceMainBlock(ph);
@@ -2091,7 +2273,7 @@ function processEnhanceBtn(asar, checkOnly, revert, srcPath, mem) {
 
   /** 移除 preload 注入串：按内核形态的新版优先，旧版串兜底（升级前的存量安装）。 */
   function stripPreload(buf, bad) {
-    for (const inj of [injectV4, injectV3, injectNew, injectOld].filter(Boolean)) {
+    for (const inj of [injectV5, injectV4, injectV3, injectNew, injectOld].filter(Boolean)) {
       if (!buf.includes(inj)) continue;
       if (countBytes(buf, inj) !== 1) { bad.push("preload 注入串不唯一"); return buf; }
       return replaceOnce(buf, inj, Buffer.alloc(0));
@@ -2442,6 +2624,189 @@ function processEditAll(target, checkOnly, revert) {
   }
 }
 
+// ---------------------------------------------------------------- 补丁体检（--doctor，只读）
+
+/** 与 zcode-tui.js 的 classify 同语义：由 --check 输出推导状态。 */
+function doctorClassify(out) {
+  const text = out || "";
+  if (text.includes("本补丁在该内核不适用")) return "na";
+  if (text.includes("部分") || text.includes("异常") || text.includes("不完整")) return "partial";
+  if (text.includes("已打")) return "applied";
+  if (text.includes("未打") || text.includes("已还原") || text.includes("没有备份")) return "not";
+  return "unknown";
+}
+
+const DOCTOR_FEATURES = [
+  { name: "思考等级透传", flag: "", kind: "kernel", witnesses: ["providerOptionsByLevel", "zCfgEffort"] },
+  { name: "全消息可编辑", flag: "--edit-all", kind: "kernel", witnesses: ["resolveEditTargetByEntityId", "editTargetByEntityId", "editDisposition"] },
+  { name: "模型 3009 重试", flag: "--model-retry", kind: "kernel", witnesses: ["ModelRateLimited", "retryReason"] },
+  { name: "用量页去截断", flag: "--usage-chart", kind: "asar", witnesses: ["AppUsageDailyModelTrendChart", "AppUsageModelUsagePieChart"] },
+  { name: "模型菜单加宽", flag: "--menu-width", kind: "asar", witnesses: ["radix-dropdown-menu-content-available-width", "w-max min-w-[min(12rem"] },
+  { name: "继续按钮", flag: "--continue-btn", kind: "asar", witnesses: ["zcode-continue.js"] },
+  { name: "TPS 统计栏", flag: "--tps-footer", kind: "asar", witnesses: ["zcode-tps.js"] },
+  { name: "模型拉取", flag: "--modelhub", kind: "asar", witnesses: ["__mhPick", "modelhub:fetch-models", "connectRemote:"] },
+  { name: "增强提示词按钮", flag: "--enhance-btn", kind: "asar", witnesses: ["zcode-enhance"] },
+  { name: "去额度骚扰横幅", flag: "--quota-banner", kind: "asar", witnesses: ["model-very-low", "model-half-used", "isReminderHidden"] },
+];
+const DOCTOR_PAYLOAD_USERS = new Set(["--modelhub", "--enhance-btn"]); // 依赖 modelhub_payload.json，缺失时跳过探针
+
+/** 漂移证据：在扫描范围内找见证关键字的命中点，输出可打印上下文片段。 */
+function printableContext(bytes, at, len) {
+  const from = Math.max(0, at - 70), to = Math.min(bytes.length, at + len + 70);
+  return bytes.toString("latin1", from, to).replace(/[^\x20-\x7e]/g, "·");
+}
+
+function doctorWitnessEvidence(witnesses, scopes) {
+  const out = [];
+  for (const w of witnesses || []) {
+    const needle = Buffer.from(w, "latin1");
+    let hits = 0;
+    for (const s of scopes) {
+      let i = 0;
+      while (hits < 3 && (i = s.bytes.indexOf(needle, i)) !== -1) {
+        out.push({ witness: w, file: s.path, at: i, context: printableContext(s.bytes, i, needle.length) });
+        hits++;
+        i += needle.length;
+      }
+      if (hits >= 3) break;
+    }
+  }
+  return out.slice(0, 8);
+}
+
+function asarAppVersion(asar) {
+  try {
+    const state = asarOpen(asar);
+    const hit = walkEntries(state.header).find((x) => x.path === "package.json");
+    if (!hit) return null;
+    return JSON.parse(entryBytes(state, hit.ent).toString("utf8")).version || null;
+  } catch { return null; }
+}
+
+function runDoctor(opts) {
+  const jsonMode = !!opts.json;
+  const report = { zcode_patcher_doctor: 1, read_only: true, host: [], rows: [], summary: null };
+  const capture = (fn) => {
+    const lines = [];
+    const orig = console.log;
+    console.log = (...a) => lines.push(a.map((x) => typeof x === "string" ? x : String(x)).join(" "));
+    try { fn(); } catch (e) { lines.push(`[!] 体检探针异常：${e && e.message}`); }
+    finally { console.log = orig; }
+    return lines.join("\n");
+  };
+
+  // 目标定位：任一步失败不中断体检，逐项标记 unknown
+  let targets = [];
+  try {
+    targets = resolveTarget(opts.target);
+  } catch (e) {
+    report.error = e.message;
+  }
+  for (const t of targets) {
+    const asar = path.join(path.dirname(path.dirname(t)), "app.asar");
+    report.host.push({
+      kernel: t,
+      kernel_size: (() => { try { return fs.statSync(t).size; } catch { return null; } })(),
+      asar: fs.existsSync(asar) ? asar : null,
+      version: fs.existsSync(asar) ? asarAppVersion(asar) : null,
+    });
+  }
+  if (!report.host.length) report.host.push({ kernel: null, asar: null, version: null });
+
+  const payloadOk = fs.existsSync(path.join(__dirname, "modelhub_payload.json"));
+  const featureRow = (feature, target, state, out) => {
+    const row = { name: feature.name, flag: feature.flag || "(default)", state, target };
+    if (state !== "applied" && state !== "na" && out) row.output = out.split("\n").filter(Boolean);
+    report.rows.push(row);
+    return row;
+  };
+
+  // 内核补丁探针
+  for (const feature of DOCTOR_FEATURES.filter((f) => f.kind === "kernel")) {
+    if (!targets.length) { featureRow(feature, null, "unknown", report.error || "未探测到 ZCode 安装"); continue; }
+    for (const t of targets) {
+      const out = capture(() => {
+        if (feature.flag === "--edit-all") processEditAll(t, true, false);
+        else if (feature.flag === "--model-retry") processModelRetry(t, true, false);
+        else processEffort(t, true, false);
+      });
+      featureRow(feature, t, doctorClassify(out), out);
+    }
+  }
+
+  // asar 补丁探针（每处安装一次性收集渲染层证据范围；repack 类共享一个 MemAsar）
+  const asarScopeFor = (feature, asar) => {
+    if (feature.kind !== "asar" || !asar) return [];
+    try {
+      const state = asarOpen(asar);
+      return walkEntries(state.header)
+        .filter(({ path: p, ent }) => p.startsWith("out/renderer/") && !ent.unpacked)
+        .map(({ path: p, ent }) => ({ path: p, bytes: entryBytes(state, ent) }));
+    } catch { return []; }
+  };
+  for (const host of report.host) {
+    const { asar } = host;
+    const kernelScopes = host.kernel ? [{ path: host.kernel, bytes: (() => { try { return fs.readFileSync(host.kernel); } catch { return Buffer.alloc(0); } })() }] : [];
+    const renderScopes = asarScopeFor(DOCTOR_FEATURES.find((f) => f.kind === "asar"), asar);
+    let mem = null;
+    for (const feature of DOCTOR_FEATURES.filter((f) => f.kind === "asar")) {
+      if (!asar) { featureRow(feature, null, "unknown", "未找到 app.asar"); continue; }
+      if (DOCTOR_PAYLOAD_USERS.has(feature.flag) && !payloadOk) {
+        featureRow(feature, asar, "unknown", "缺少 modelhub_payload.json（应与 zcode-patcher.js 同目录）");
+        continue;
+      }
+      const isRepack = ["--continue-btn", "--tps-footer", "--modelhub", "--enhance-btn"].includes(feature.flag);
+      let out;
+      if (isRepack) {
+        if (!mem) { try { mem = memAsarOpen(asar); mem.healPkgJson(true); } catch { mem = null; } }
+        if (!mem) { featureRow(feature, asar, "unknown", "app.asar 无法读取"); continue; }
+        out = capture(() => {
+          if (feature.flag === "--continue-btn") processContinueBtn(asar, true, false, null, mem);
+          else if (feature.flag === "--tps-footer") processTpsFooter(asar, true, false, null, mem);
+          else if (feature.flag === "--modelhub") processModelhub(asar, true, false, mem);
+          else processEnhanceBtn(asar, true, false, null, mem);
+        });
+      } else {
+        out = capture(() => {
+          if (feature.flag === "--usage-chart") processUsageChart(asar, true, false);
+          else if (feature.flag === "--menu-width") processMenuWidth(asar, true, false);
+          else processQuotaBanner(asar, true, false);
+        });
+      }
+      const row = featureRow(feature, asar, doctorClassify(out), out);
+      if (row.state === "partial" || row.state === "unknown") {
+        row.evidence = doctorWitnessEvidence(feature.witnesses,
+          feature.flag === "--edit-all" || feature.flag === "--model-retry" || feature.flag === ""
+            ? kernelScopes : renderScopes);
+      }
+    }
+  }
+
+  const cnt = { applied: 0, not: 0, na: 0, partial: 0, unknown: 0 };
+  for (const r of report.rows) cnt[r.state] = (cnt[r.state] || 0) + 1;
+  report.summary = cnt;
+
+  if (jsonMode) {
+    console.log(JSON.stringify(report, null, 1));
+  } else {
+    console.log(`=== ZCode 补丁体检（--doctor，只读） ===`);
+    for (const h of report.host) {
+      console.log(`[*] 内核 ${h.kernel || "(未找到)"}${h.kernel_size ? `（${h.kernel_size.toLocaleString()} 字节）` : ""}` +
+        ` | app.asar ${h.asar || "未找到"}${h.version ? ` | 版本 ${h.version}` : ""}`);
+    }
+    if (report.error) console.log(`[!] ${report.error}`);
+    const mark = { applied: "[=]", not: "[ ]", na: "[-]", partial: "[!]", unknown: "[?]" };
+    for (const r of report.rows) {
+      console.log(`  ${mark[r.state] || "[?]"} ${r.name.padEnd(10)} ${r.state}${r.target ? ` | ${path.basename(r.target)}` : ""}`);
+      for (const line of r.output || []) console.log(`        ${line}`);
+      for (const ev of r.evidence || []) console.log(`        证据 ${ev.file} @${ev.at}: ${ev.context}`);
+    }
+    console.log(`汇总: 已打 ${cnt.applied} · 未打 ${cnt.not} · 不适用 ${cnt.na} · 部分/异常 ${cnt.partial} · 未知(漂移嫌疑) ${cnt.unknown}`);
+    console.log("未知/异常项 = 锚点在该安装上失配，按 SKILL.md《升级后自查清单》处理；上方「证据」为见证关键字的现场上下文，可直接用于给 payload 加新变体组。");
+  }
+  if (cnt.partial || cnt.unknown) process.exitCode = 2;
+}
+
 // ---------------------------------------------------------------- 主入口
 
 function resolveAsars(target) {
@@ -2462,6 +2827,8 @@ function usage() {
   --check        只检查状态，不修改
   --revert       从备份/记录还原
   --extract      按结构特征提取当前内核的档位解析函数锚点（升级后用）
+  --doctor       补丁体检：一次跑完全部 --check 并汇总，失配项自动收集锚点漂移证据（只读）
+  --json         与 --doctor 连用：输出机器可读 JSON 报告
   --usage-chart  用量页去截断：趋势图/饼图全量展示
   --menu-width   模型菜单加宽：供应商子菜单 192/160px→384px，长模型名完整显示
   --continue-btn 继续按钮：一键填入「继续」并发送（✨右侧）
@@ -2479,7 +2846,7 @@ function usage() {
 function main() {
   const argv = process.argv.slice(2);
   const opts = {
-    target: null, check: false, revert: false, extract: false,
+    target: null, check: false, revert: false, extract: false, doctor: false, json: false,
     usageChart: false, tpsFooter: false, modelhub: false, enhanceBtn: false, editAll: false, menuWidth: false, continueBtn: false, quotaBanner: false,
     modelRetry: false,
     tpsSrc: null, enhanceSrc: null, contSrc: null,
@@ -2490,6 +2857,8 @@ function main() {
       case "--check": opts.check = true; break;
       case "--revert": opts.revert = true; break;
       case "--extract": opts.extract = true; break;
+      case "--doctor": opts.doctor = true; break;
+      case "--json": opts.json = true; break;
       case "--usage-chart": opts.usageChart = true; break;
       case "--menu-width": opts.menuWidth = true; break;
       case "--continue-btn": opts.continueBtn = true; break;
@@ -2510,6 +2879,11 @@ function main() {
   }
 
   const asarFlags = opts.usageChart || opts.menuWidth || opts.continueBtn || opts.tpsFooter || opts.modelhub || opts.enhanceBtn || opts.quotaBanner;
+
+  if (opts.doctor) {
+    runDoctor(opts); // 恒为只读检查，--check/--revert 不参与语义
+    return;
+  }
 
   // asar 补丁注册表：新增 asar 类补丁 = 加一行 + processX 支持 mem 参数（批量合并落盘）。
   // repack: true 的补丁走 MemAsar 共享内存态，多个同时请求时合并为一次全量重打包；

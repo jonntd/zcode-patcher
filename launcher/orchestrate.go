@@ -190,7 +190,7 @@ func forceQuitThenPass(rt jsRuntime, rest []string) int {
 	modifying := true
 	for _, a := range rest {
 		switch a {
-		case "--check", "--revert", "--status", "--check-all", "--json":
+		case "--check", "--revert", "--status", "--check-all", "--json", "--doctor":
 			modifying = false
 		}
 	}

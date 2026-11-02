@@ -40,7 +40,7 @@ case "${1:-start}" in
     sync_bed
     echo "[i] 对副本打全套补丁..."
     node "$PATCHER" --usage-chart --menu-width --continue-btn --tps-footer --modelhub \
-      --enhance-btn --quota-banner --edit-all "$BED" >/dev/null || { echo "[x] 打补丁失败"; exit 1; }
+      --enhance-btn --quota-banner --edit-all --model-retry "$BED" >/dev/null || { echo "[x] 打补丁失败"; exit 1; }
     echo "[i] 隔离启动副本，CDP 端口 ${PORT}..."
     ZCODE_DESKTOP_USER_DATA_DIR="$UD" ZCODE_DESKTOP_HOME_DIR="$HOME_DIR" \
       "$BED/Contents/MacOS/ZCode" --remote-debugging-port="$PORT" > /tmp/zcode-dev-bed.log 2>&1 &
@@ -60,7 +60,7 @@ case "${1:-start}" in
     for pid in $(bed_running); do kill "$pid" 2>/dev/null; done
     sleep 2
     node "$PATCHER" --usage-chart --menu-width --continue-btn --tps-footer --modelhub \
-      --enhance-btn --quota-banner --edit-all "$BED" || exit 1
+      --enhance-btn --quota-banner --edit-all --model-retry "$BED" || exit 1
     echo "[√] 副本补丁已更新，scripts/dev-bed.sh start 重新拉起"
     ;;
   stop)

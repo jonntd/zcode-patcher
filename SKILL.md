@@ -84,7 +84,11 @@ description: "[仅手动调用，禁止自动触发] ZCode 客户端本地补丁
 
 ## 升级后自查清单
 
-ZCode 升级会覆盖 zcode.cjs 与 app.asar，升级后过一遍：
+ZCode 升级会覆盖 zcode.cjs 与 app.asar，升级后过一遍。
+
+**第一步（推荐）**：`node zcode-patcher.js --doctor` —— 一次跑完全部 10 项检查并汇总（已打/未打/不适用/未知），失配项自动收集锚点漂移证据（渲染层见证关键字命中的文件、位置与上下文字节片段），加 `--json` 输出机器可读报告供 AI 分析。全绿（exit 0）即收工；有「未知」项时按下面逐条 `--check` 深挖，或直接拿证据段给 payload 加新变体组。
+
+逐条检查（`--doctor` 的展开版）：
 
 ```bash
 node zcode-patcher.js --check            # 思考等级补丁状态
@@ -100,6 +104,8 @@ node zcode-patcher.js --model-retry --check
 ```
 
 失配的按「自助使用流程」重打；思考等级补丁在新内核上先 `--extract` 确认锚点可提取。
+
+**锚点漂移的两道识别层**：字面变体组（`*_V2` 追加模式）命中的是已适配版本；字面组全部失配时，edit-all / model-retry / quota-banner / menu-width 会走**结构化锚点兜底**——按结构正则捕获压缩后的实际变量名、动态合成等长替换串，纯改名类版本漂移零适配自动命中（check 输出里锚点组带「结构化」字样即是）。结构本身变了（决策链重写、函数被删）才需要人工分析，此时 `--doctor` 的证据段就是起点。
 
 ## 一、思考等级：完整结论一张表
 
