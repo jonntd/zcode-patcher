@@ -76,14 +76,15 @@ jobs:
             test -f "$f" || { echo "::error::missing $f"; exit 1; }
           done
           # 版本号必须已注入二进制（作为缓存标记），否则发布的产物版本错位。
-          strings dist/zcode-patch-linux-x64 | grep -q "$VERSION" \
+          # 注意用 grep -a 而不是 strings——Go 二进制里的内嵌串 strings 会漏（AGENTS.md 的坑）。
+          grep -aq "$VERSION" dist/zcode-patch-linux-x64 \
             || { echo "::error::launcher does not embed version $VERSION"; exit 1; }
           # 宿主即 Linux/amd64，可直接运行产物验证非交互 JSON 输出。
           chmod +x dist/zcode-patch-linux-x64
           ./dist/zcode-patch-linux-x64 --json | node -e "
             let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
               const d=JSON.parse(s);
-              if(!Array.isArray(d)||d.length!==9){console.error('bad status json');process.exit(1);}
+              if(!Array.isArray(d)||d.length!==10){console.error('bad status json: '+d.length+' rows (expect 10)');process.exit(1);}
               console.log('launcher OK: '+d.length+' patches');
             });"
 
